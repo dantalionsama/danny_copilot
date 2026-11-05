@@ -17,7 +17,7 @@ An out-of-character (OOC) assistant for [Lumiverse](https://docs.lumiverse.chat/
 ## Install
 
 1. In Lumiverse, open the **Extensions** panel.
-2. Install from GitHub: `https://github.com/YOURNAME/danny-copilot`
+2. Install from GitHub: `https://github.com/dantalionsama/danny_copilot`
 3. Approve the permissions and enable the extension.
 
 A **Copilot** tab appears in the sidebar.
