@@ -1,31 +1,98 @@
-const ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`;
+const svg = (inner, size = 16) =>
+  `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
+
+const ICONS = {
+  tab: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  sliders: '<line x1="21" y1="4" x2="14" y2="4"/><line x1="10" y1="4" x2="3" y2="4"/><line x1="21" y1="12" x2="12" y2="12"/><line x1="8" y1="12" x2="3" y2="12"/><line x1="21" y1="20" x2="16" y2="20"/><line x1="12" y1="20" x2="3" y2="20"/><line x1="14" y1="2" x2="14" y2="6"/><line x1="8" y1="10" x2="8" y2="14"/><line x1="16" y1="18" x2="16" y2="22"/>',
+  trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+  refresh: '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>',
+  send: '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
+  cpu: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
+  check: '<polyline points="20 6 9 17 4 12"/>',
+};
 
 const STYLES = `
-  .cp-root { display:flex; flex-direction:column; height:100%; gap:8px; padding:10px; box-sizing:border-box; color:var(--lumiverse-text, inherit); }
-  .cp-row { display:flex; gap:6px; align-items:center; font-size:12px; }
-  .cp-row select { flex:1; min-width:0; }
-  .cp-row input[type=number] { width:56px; }
-  .cp-dim { font-size:11px; color:var(--lumiverse-text-dim, rgba(127,127,127,0.7)); }
-  .cp-set { display:none; flex-direction:column; gap:6px; padding:8px; font-size:12px;
-    border:1px solid var(--lumiverse-border, rgba(127,127,127,0.25));
-    border-radius:var(--lumiverse-radius, 8px); }
+  .cp-root {
+    --cp-primary: var(--lumiverse-primary, #7c6dfa);
+    --cp-muted: var(--lumiverse-text-muted, rgba(127,127,127,0.85));
+    --cp-border: var(--lumiverse-border, rgba(127,127,127,0.28));
+    --cp-fill: var(--lumiverse-fill-subtle, rgba(127,127,127,0.08));
+    --cp-fill-hover: var(--lumiverse-fill-hover, rgba(127,127,127,0.16));
+    --cp-surface: var(--lumiverse-bg-elevated, rgba(127,127,127,0.1));
+    --cp-tint: var(--lumiverse-primary-010, rgba(124,109,250,0.1));
+    --cp-radius: var(--lumiverse-radius, 10px);
+    --cp-on-primary: var(--lumiverse-primary-text, #fff);
+    display:flex; flex-direction:column; height:100%; gap:8px; padding:10px; box-sizing:border-box;
+    color:var(--lumiverse-text, inherit); font-family:var(--lumiverse-font-family, inherit); font-size:13px;
+  }
+  .cp-root select, .cp-root input, .cp-root textarea, .cp-root button { font:inherit; color:inherit; box-sizing:border-box; }
+
+  .cp-row { display:flex; gap:6px; align-items:center; }
+  .cp-ico { display:grid; place-items:center; flex:none; color:var(--cp-muted); }
+  .cp-dim { font-size:11px; color:var(--cp-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+  .cp-sel {
+    appearance:none; -webkit-appearance:none; height:30px; padding:0 26px 0 10px; min-width:0; cursor:pointer;
+    background-color:var(--cp-surface); border:1px solid var(--cp-border); border-radius:var(--cp-radius);
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+    background-repeat:no-repeat; background-position:right 8px center; text-overflow:ellipsis;
+  }
+  .cp-sel option { background:var(--lumiverse-bg-elevated, #1a1a1f); color:var(--lumiverse-text, inherit); }
+  .cp-sel:focus, .cp-num:focus, .cp-input:focus, .cp-edit:focus, .cp-set textarea:focus { outline:none; border-color:var(--cp-primary); }
+
+  .cp-ibtn {
+    width:30px; height:30px; flex:none; display:grid; place-items:center; padding:0; cursor:pointer;
+    background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:var(--cp-radius);
+    transition:background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .cp-ibtn:hover { background:var(--cp-fill-hover); }
+  .cp-ibtn.on { border-color:var(--cp-primary); color:var(--cp-primary); }
+
+  .cp-ctx { flex:1; min-width:0; display:flex; align-items:center; gap:6px; color:var(--cp-muted); font-size:11px; letter-spacing:0.04em; }
+  .cp-ctx input[type=range] { flex:1; min-width:30px; accent-color:var(--cp-primary); }
+  .cp-num { width:44px; height:30px; flex:none; text-align:center; padding:0 4px;
+    background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
+
+  .cp-set { display:none; flex-direction:column; gap:8px; padding:10px; font-size:12px;
+    background:var(--cp-fill); border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
   .cp-set.open { display:flex; }
-  .cp-set label { display:flex; gap:6px; align-items:center; }
-  .cp-set textarea { height:110px; resize:vertical; }
-  .cp-log { flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:8px; }
-  .cp-wrap { display:flex; flex-direction:column; gap:2px; max-width:92%; }
-  .cp-wrap.user { align-self:flex-end; align-items:flex-end; }
-  .cp-wrap.assistant { align-self:flex-start; }
-  .cp-msg { white-space:pre-wrap; padding:8px 10px; font-size:13px; word-break:break-word;
-    background:var(--lumiverse-fill-subtle, rgba(127,127,127,0.1));
-    border:1px solid var(--lumiverse-border, rgba(127,127,127,0.25));
-    border-radius:var(--lumiverse-radius, 8px); }
-  .cp-bar { display:flex; gap:10px; opacity:0.55; }
-  .cp-bar:hover { opacity:1; }
-  .cp-act { background:none; border:none; padding:0; font-size:11px; cursor:pointer; color:inherit; }
-  .cp-act:hover { text-decoration:underline; }
-  .cp-edit { width:100%; min-height:80px; resize:vertical; }
-  .cp-input { flex:1; resize:none; height:60px; }
+  .cp-check { display:flex; gap:8px; align-items:center; cursor:pointer; }
+  .cp-check input { accent-color:var(--cp-primary); }
+  .cp-set textarea { height:110px; resize:vertical; padding:8px 10px; line-height:1.4;
+    background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
+
+  .cp-btn { height:28px; padding:0 12px; cursor:pointer; background:var(--cp-surface);
+    border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
+  .cp-btn:hover { background:var(--cp-fill-hover); }
+  .cp-btn.primary { background:var(--cp-primary); border-color:transparent; color:var(--cp-on-primary); }
+
+  .cp-log { flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:2px; scrollbar-width:thin; }
+  .cp-wrap { display:flex; flex-direction:column; gap:3px; min-width:0; }
+  .cp-wrap.user { align-self:flex-end; align-items:flex-end; max-width:88%; }
+  .cp-wrap.assistant { align-self:stretch; }
+  .cp-msg { white-space:pre-wrap; padding:9px 12px; line-height:1.5; word-break:break-word;
+    border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
+  .cp-msg.user { background:var(--cp-tint); border-color:color-mix(in srgb, var(--cp-primary) 35%, transparent); }
+  .cp-msg.assistant { background:var(--cp-fill); }
+
+  .cp-bar { display:flex; gap:2px; align-items:center; opacity:0.5; transition:opacity 0.15s; }
+  .cp-wrap:hover .cp-bar, .cp-bar.show { opacity:1; }
+  .cp-act { width:24px; height:24px; display:grid; place-items:center; padding:0; background:none;
+    border:none; border-radius:6px; cursor:pointer; color:inherit; }
+  .cp-act:hover { background:var(--cp-fill-hover); }
+  .cp-edit { width:100%; min-height:80px; resize:vertical; padding:8px 10px; line-height:1.4;
+    background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
+
+  .cp-inputbar { display:flex; align-items:flex-end; gap:8px; }
+  .cp-input { flex:1; min-width:0; resize:none; min-height:38px; max-height:140px; padding:9px 14px; line-height:1.4;
+    background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:19px; }
+  .cp-send { width:38px; height:38px; flex:none; display:grid; place-items:center; padding:0; cursor:pointer;
+    border:1px solid transparent; border-radius:50%; background:var(--cp-primary); color:var(--cp-on-primary); }
+  .cp-send.busy { background:var(--cp-surface); color:inherit; border-color:var(--cp-border); }
+
   .cp-md { white-space:normal; }
   .cp-md p, .cp-md ul, .cp-md ol, .cp-md blockquote, .cp-md pre { margin:0 0 0.6em; }
   .cp-md > :last-child { margin-bottom:0; }
@@ -33,12 +100,12 @@ const STYLES = `
   .cp-md h1, .cp-md h2, .cp-md h3, .cp-md h4 { font-size:1em; font-weight:700; margin:0.4em 0 0.3em; }
   .cp-md h1 { font-size:1.15em; }
   .cp-md h2 { font-size:1.08em; }
-  .cp-md blockquote { border-left:3px solid rgba(127,127,127,0.5); padding-left:10px; opacity:0.85; }
-  .cp-md pre { overflow-x:auto; padding:8px; background:rgba(127,127,127,0.15); border-radius:6px; }
-  .cp-md code { font-family:monospace; font-size:12px; background:rgba(127,127,127,0.15); padding:0 4px; border-radius:4px; }
+  .cp-md blockquote { border-left:3px solid var(--cp-border); padding-left:10px; opacity:0.85; }
+  .cp-md pre { overflow-x:auto; padding:8px 10px; background:var(--cp-fill-hover); border-radius:8px; }
+  .cp-md code { font-family:var(--lumiverse-font-mono, monospace); font-size:12px; background:var(--cp-fill-hover); padding:0 4px; border-radius:4px; }
   .cp-md pre code { background:none; padding:0; }
-  .cp-md a { color:inherit; text-decoration:underline; }
-  .cp-md hr { border:none; border-top:1px solid rgba(127,127,127,0.4); margin:0.6em 0; }
+  .cp-md a { color:var(--cp-primary); text-decoration:underline; }
+  .cp-md hr { border:none; border-top:1px solid var(--cp-border); margin:0.6em 0; }
 `;
 
 // ---------- markdown ----------
@@ -175,6 +242,8 @@ export function setup(ctx) {
   let sendKey = null;
   let raf = 0;
   let defaultSystem = "";
+  let clearArmed = false;
+  let clearTimer = 0;
   let settings = {
     mode: "chat",
     ctxCount: 10,
@@ -193,7 +262,7 @@ export function setup(ctx) {
     description: "OOC assistant for brainstorming and lore",
     keywords: ["copilot", "ooc", "assistant", "brainstorm"],
     headerTitle: "Copilot",
-    iconSvg: ICON,
+    iconSvg: svg(ICONS.tab, 24),
   });
 
   const el = (tag, cls, text) => {
@@ -202,65 +271,85 @@ export function setup(ctx) {
     if (text) e.textContent = text;
     return e;
   };
+  const iconBtn = (icon, title, cls) => {
+    const b = el("button", cls || "cp-ibtn");
+    b.innerHTML = svg(icon, 16);
+    b.title = title;
+    b.setAttribute("aria-label", title);
+    return b;
+  };
 
   const root = el("div", "cp-root");
 
-  // top row
+  // row 1: mode, CTX slider, settings, clear
   const topRow = el("div", "cp-row");
-  const modeSelect = el("select");
+  const modeSelect = el("select", "cp-sel");
+  modeSelect.style.width = "104px";
   for (const [v, t] of [["chat", "This chat"], ["general", "General"]]) {
     const o = el("option", "", t);
     o.value = v;
     modeSelect.appendChild(o);
   }
-  const settingsBtn = el("button", "", "⚙");
-  settingsBtn.title = "Settings";
-  const clearBtn = el("button", "", "Clear");
-  clearBtn.title = "Clear Copilot history for this session";
-  topRow.append(modeSelect, settingsBtn, clearBtn);
+
+  const ctxWrap = el("div", "cp-ctx");
+  const ctxRange = el("input");
+  ctxRange.type = "range";
+  ctxRange.min = "0";
+  ctxRange.max = "50";
+  ctxRange.title = "How many recent chat messages Copilot can see";
+  const ctxNum = el("input", "cp-num");
+  ctxNum.type = "number";
+  ctxNum.min = "0";
+  ctxNum.max = "200";
+  ctxWrap.append(el("span", "", "CTX"), ctxRange);
+
+  const settingsBtn = iconBtn(ICONS.sliders, "Settings");
+  const clearBtn = iconBtn(ICONS.trash, "Clear history");
+  topRow.append(modeSelect, ctxWrap, ctxNum, settingsBtn, clearBtn);
+
+  // row 2: connection
+  const connRow = el("div", "cp-row");
+  const connIco = el("span", "cp-ico");
+  connIco.innerHTML = svg(ICONS.cpu, 16);
+  const connSelect = el("select", "cp-sel");
+  connSelect.style.flex = "1";
+  connSelect.title = "Connection used for Copilot";
+  connRow.append(connIco, connSelect);
 
   // settings panel
   const setPanel = el("div", "cp-set");
-
-  const connRow = el("label");
-  const connSelect = el("select");
-  connSelect.style.flex = "1";
-  connRow.append(el("span", "", "Connection"), connSelect);
-
-  const ctxRow = el("label");
-  const ctxInput = el("input");
-  ctxInput.type = "number";
-  ctxInput.min = "0";
-  ctxInput.max = "200";
-  ctxRow.append(el("span", "", "Recent chat messages"), ctxInput);
-
-  const cardRow = el("label");
+  const cardRow = el("label", "cp-check");
   const cardCb = el("input");
   cardCb.type = "checkbox";
   cardRow.append(cardCb, el("span", "", "Include character card"));
-
-  const personaRow = el("label");
+  const personaRow = el("label", "cp-check");
   const personaCb = el("input");
   personaCb.type = "checkbox";
   personaRow.append(personaCb, el("span", "", "Include persona"));
-
-  const promptLabel = el("span", "", "System prompt");
+  const promptLabel = el("span", "cp-dim", "System prompt");
   const promptTa = el("textarea");
-  const resetBtn = el("button", "", "Reset prompt");
-
-  setPanel.append(connRow, ctxRow, cardRow, personaRow, promptLabel, promptTa, resetBtn);
+  const resetBtn = el("button", "cp-btn", "Reset prompt");
+  resetBtn.style.alignSelf = "flex-start";
+  setPanel.append(cardRow, personaRow, promptLabel, promptTa, resetBtn);
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
 
-  const inputRow = el("div", "cp-row");
+  // input
+  const inputBar = el("div", "cp-inputbar");
   const input = el("textarea", "cp-input");
-  input.placeholder = "Ask Copilot…";
-  const sendBtn = el("button", "", "Send");
-  inputRow.append(input, sendBtn);
+  input.rows = 1;
+  input.placeholder = "Ask about the roleplay…";
+  const sendBtn = el("button", "cp-send");
+  inputBar.append(input, sendBtn);
 
-  root.append(topRow, setPanel, chatLine, log, inputRow);
+  root.append(topRow, connRow, setPanel, chatLine, log, inputBar);
   tab.root.appendChild(root);
+
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 140) + "px";
+  });
 
   // ---------- settings ----------
   function saveSettings() {
@@ -269,14 +358,24 @@ export function setup(ctx) {
 
   function syncSettingsUI() {
     modeSelect.value = settings.mode;
-    ctxInput.value = String(settings.ctxCount);
+    ctxNum.value = String(settings.ctxCount);
+    ctxRange.value = String(Math.min(50, settings.ctxCount));
     cardCb.checked = !!settings.includeCard;
     personaCb.checked = !!settings.includePersona;
     promptTa.value = settings.systemPrompt || defaultSystem;
   }
 
-  settingsBtn.addEventListener("click", () => setPanel.classList.toggle("open"));
+  function commitCtx(n) {
+    settings.ctxCount = Math.max(0, Math.min(200, Math.floor(Number(n) || 0)));
+    ctxNum.value = String(settings.ctxCount);
+    ctxRange.value = String(Math.min(50, settings.ctxCount));
+    saveSettings();
+  }
 
+  settingsBtn.addEventListener("click", () => {
+    const open = setPanel.classList.toggle("open");
+    settingsBtn.classList.toggle("on", open);
+  });
   modeSelect.addEventListener("change", () => {
     settings.mode = modeSelect.value;
     saveSettings();
@@ -286,11 +385,9 @@ export function setup(ctx) {
     settings.connectionId = connSelect.value;
     saveSettings();
   });
-  ctxInput.addEventListener("change", () => {
-    settings.ctxCount = Math.max(0, Math.min(200, Number(ctxInput.value) || 0));
-    ctxInput.value = String(settings.ctxCount);
-    saveSettings();
-  });
+  ctxRange.addEventListener("input", () => { ctxNum.value = ctxRange.value; });
+  ctxRange.addEventListener("change", () => commitCtx(ctxRange.value));
+  ctxNum.addEventListener("change", () => commitCtx(ctxNum.value));
   cardCb.addEventListener("change", () => { settings.includeCard = cardCb.checked; saveSettings(); });
   personaCb.addEventListener("change", () => { settings.includePersona = personaCb.checked; saveSettings(); });
   promptTa.addEventListener("change", () => {
@@ -310,9 +407,17 @@ export function setup(ctx) {
     ctx.sendToBackend({ type: "save_history", key: currentKey, history: history.slice(-200) });
   }
 
-  function actBtn(label, title, fn) {
-    const b = el("button", "cp-act", label);
+  function actBtn(icon, title, fn) {
+    const b = el("button", "cp-act");
+    b.innerHTML = svg(icon, 14);
     b.title = title;
+    b.setAttribute("aria-label", title);
+    b.addEventListener("click", fn);
+    return b;
+  }
+
+  function textBtn(label, primary, fn) {
+    const b = el("button", "cp-btn" + (primary ? " primary" : ""), label);
     b.addEventListener("click", fn);
     return b;
   }
@@ -328,22 +433,22 @@ export function setup(ctx) {
     }
 
     const bar = el("div", "cp-bar");
-    const copyBtn = actBtn("Copy", "Copy text", async () => {
+    const copyBtn = actBtn(ICONS.copy, "Copy text", async () => {
       const ok = await copyText(m.content);
-      copyBtn.textContent = ok ? "Copied" : "Failed";
-      setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+      copyBtn.innerHTML = svg(ok ? ICONS.check : ICONS.copy, 14);
+      setTimeout(() => { copyBtn.innerHTML = svg(ICONS.copy, 14); }, 1200);
     });
     bar.appendChild(copyBtn);
 
     if (!busy) {
-      bar.appendChild(actBtn("Edit", "Edit message", () => startEdit(i, wrap)));
-      bar.appendChild(actBtn("Delete", "Delete message", () => {
+      bar.appendChild(actBtn(ICONS.edit, "Edit message", () => startEdit(i, wrap)));
+      bar.appendChild(actBtn(ICONS.trash, "Delete message", () => {
         history.splice(i, 1);
         saveHistory();
         renderHistory();
       }));
       if (i === history.length - 1) {
-        bar.appendChild(actBtn(m.role === "assistant" ? "Regen" : "Retry", "Generate again", regen));
+        bar.appendChild(actBtn(ICONS.refresh, m.role === "assistant" ? "Regenerate" : "Retry", regen));
       }
     }
 
@@ -354,10 +459,9 @@ export function setup(ctx) {
   function startEdit(i, wrap) {
     const ta = el("textarea", "cp-edit");
     ta.value = history[i].content;
-    const bar = el("div", "cp-bar");
-    bar.style.opacity = "1";
+    const bar = el("div", "cp-bar show");
     bar.append(
-      actBtn("Save", "Save edit", () => {
+      textBtn("Save", true, () => {
         const v = ta.value.trim();
         if (v) {
           history[i].content = v;
@@ -365,8 +469,9 @@ export function setup(ctx) {
         }
         renderHistory();
       }),
-      actBtn("Cancel", "Cancel", () => renderHistory()),
+      textBtn("Cancel", false, () => renderHistory()),
     );
+    bar.style.gap = "6px";
     wrap.replaceChildren(ta, bar);
     ta.focus();
   }
@@ -379,16 +484,35 @@ export function setup(ctx) {
 
   clearBtn.addEventListener("click", () => {
     if (busy) return;
+    if (!clearArmed) {
+      clearArmed = true;
+      clearBtn.classList.add("on");
+      clearBtn.title = "Click again to clear";
+      clearTimer = setTimeout(disarmClear, 2500);
+      return;
+    }
+    disarmClear();
     history = [];
     renderHistory();
     saveHistory();
   });
 
+  function disarmClear() {
+    clearArmed = false;
+    clearTimeout(clearTimer);
+    clearBtn.classList.remove("on");
+    clearBtn.title = "Clear history";
+  }
+
   // ---------- generation ----------
   function setBusy(v) {
     busy = v;
-    sendBtn.textContent = v ? "Stop" : "Send";
+    sendBtn.innerHTML = svg(v ? ICONS.stop : ICONS.send, 18);
+    sendBtn.classList.toggle("busy", v);
+    sendBtn.title = v ? "Stop" : "Send";
+    sendBtn.setAttribute("aria-label", v ? "Stop" : "Send");
   }
+  setBusy(false);
 
   function paintStream() {
     raf = 0;
@@ -432,6 +556,7 @@ export function setup(ctx) {
     const text = input.value.trim();
     if (!text) return;
     input.value = "";
+    input.style.height = "auto";
     const prior = history.slice();
     history.push({ role: "user", content: text });
     saveHistory();
@@ -481,12 +606,14 @@ export function setup(ctx) {
         }
         syncSettingsUI();
 
+        const general = settings.mode === "general" || !p.chat;
         chatLine.textContent =
           settings.mode === "general"
             ? "General chat (no chat context)"
             : p.chat
               ? "Chat: " + p.chat.name
               : "No active chat, using General";
+        input.placeholder = general ? "Ask anything…" : "Ask about the roleplay…";
 
         if (p.sessionKey !== currentKey) {
           if (busy) {
@@ -535,6 +662,7 @@ export function setup(ctx) {
 
   return () => {
     if (raf) cancelAnimationFrame(raf);
+    clearTimeout(clearTimer);
     unsubBackend();
     unsubChatSwitch();
     removeStyle();
