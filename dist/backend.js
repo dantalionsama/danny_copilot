@@ -9,11 +9,14 @@ const DEFAULTS = {
   connectionId: "",
   includeCard: true,
   includePersona: true,
+  includeLore: false,
+  loreBudget: 1500,
   systemPrompt: "",
 };
 
 let controller = null;
 const cache = {};
+const loreCache = new Map();
 const uk = (userId) => userId || "_";
 const clip = (s, n) => String(s || "").slice(0, n);
 
@@ -35,6 +38,9 @@ function cleanSettings(s) {
     if (typeof s.connectionId === "string") o.connectionId = s.connectionId;
     o.includeCard = s.includeCard !== false;
     o.includePersona = s.includePersona !== false;
+    o.includeLore = s.includeLore === true;
+    const lb = Number(s.loreBudget);
+    if (Number.isFinite(lb)) o.loreBudget = Math.max(200, Math.min(8000, Math.floor(lb)));
     if (typeof s.systemPrompt === "string") o.systemPrompt = s.systemPrompt.slice(0, 8000);
   }
   return o;
@@ -81,6 +87,47 @@ function personaBlock(p) {
   return `<user_persona name="${p.name}">\n${parts.join("\n\n")}\n</user_persona>`;
 }
 
+// Real triggered lorebook content, taken from a dry run of Lumiverse's own prompt assembly.
+// Cached briefly so previews and sends don't re-run it for the same chat state.
+async function getLore(chatId, userId, sig) {
+  const key = `${uk(userId)}|${chatId}|${sig}`;
+  const hit = loreCache.get(key);
+  if (hit && Date.now() - hit.at < 60000) return hit;
+
+  const result = await spindle.generate.dryRun({ chatId }, userId);
+  const blocks = (result.breakdown || [])
+    .filter((b) => b && b.type === "world_info" && typeof b.content === "string" && b.content.trim())
+    .map((b) => ({ name: String(b.name || "World Info"), content: b.content }));
+
+  const entry = { at: Date.now(), blocks, stats: result.worldInfoStats || null };
+  if (loreCache.size > 20) loreCache.clear();
+  loreCache.set(key, entry);
+  return entry;
+}
+
+function budgetLore(blocks, budgetTokens) {
+  let remaining = budgetTokens * 4;
+  let trimmed = false;
+  let skipped = 0;
+  const out = [];
+  for (const b of blocks) {
+    if (remaining <= 0) { skipped++; continue; }
+    let text = b.content;
+    if (text.length > remaining) {
+      let cut = text.slice(0, remaining);
+      const nl = cut.lastIndexOf("\n");
+      if (nl > remaining * 0.5) cut = cut.slice(0, nl);
+      text = cut.trimEnd() + "\n[…trimmed to fit the lorebook budget]";
+      trimmed = true;
+      remaining = 0;
+    } else {
+      remaining -= text.length;
+    }
+    out.push({ name: b.name, text });
+  }
+  return { out, trimmed, skipped };
+}
+
 // Builds everything that goes into the system message, as labelled sections.
 // Used by both generation and the Context preview so they can never drift apart.
 async function buildContext(userId, settings) {
@@ -90,6 +137,7 @@ async function buildContext(userId, settings) {
   const sections = [
     { id: "system", label: "System prompt", text: settings.systemPrompt.trim() || DEFAULT_SYSTEM },
   ];
+  const notes = [];
 
   if (useChat) {
     if (settings.includeCard && active.character_id) {
@@ -110,8 +158,39 @@ async function buildContext(userId, settings) {
       }
     }
 
+    let msgs = [];
+    if (settings.ctxCount > 0 || settings.includeLore) {
+      msgs = await spindle.chat.getMessages(active.id);
+    }
+
+    if (settings.includeLore) {
+      try {
+        const last = msgs[msgs.length - 1];
+        const sig = `${msgs.length}:${last && last.id ? last.id : ""}:${last ? String(last.content).length : 0}`;
+        const lore = await getLore(active.id, userId, sig);
+        const st = lore.stats;
+        if (st) notes.push(`Lorebook: ${st.activatedAfterBudget} of ${st.totalCandidates} entries triggered.`);
+        if (!lore.blocks.length) {
+          notes.push("No lorebook entries are triggered right now.");
+        } else {
+          const b = budgetLore(lore.blocks, settings.loreBudget);
+          b.out.forEach((x, i) => {
+            sections.push({
+              id: `lore${i}`,
+              label: `Lorebook: ${x.name}`,
+              text: `<lorebook name="${x.name}">\n${x.text}\n</lorebook>`,
+            });
+          });
+          if (b.trimmed) notes.push(`Lorebook trimmed to fit the ~${settings.loreBudget} token budget.`);
+          if (b.skipped) notes.push(`${b.skipped} lorebook block(s) skipped (over budget).`);
+        }
+      } catch (e) {
+        spindle.log.warn("[Copilot] lorebook failed: " + e.message);
+        notes.push("Lorebook unavailable: " + e.message);
+      }
+    }
+
     if (settings.ctxCount > 0) {
-      const msgs = await spindle.chat.getMessages(active.id);
       const recent = msgs.slice(-settings.ctxCount);
       if (recent.length) {
         const transcript = recent.map((m) => `[${m.role}] ${m.content}`).join("\n\n");
@@ -124,7 +203,7 @@ async function buildContext(userId, settings) {
     }
   }
 
-  return { sections, useChat };
+  return { sections, notes, useChat };
 }
 
 spindle.log.info("[Copilot] backend started");
@@ -161,8 +240,8 @@ spindle.onFrontendMessage(async (payload, userId) => {
     case "context_preview": {
       try {
         const settings = await getSettings(userId);
-        const { sections, useChat } = await buildContext(userId, settings);
-        spindle.sendToFrontend({ type: "context_preview", sections, useChat }, userId);
+        const { sections, notes, useChat } = await buildContext(userId, settings);
+        spindle.sendToFrontend({ type: "context_preview", sections, notes, useChat }, userId);
       } catch (e) {
         spindle.log.warn("[Copilot] context preview failed: " + e.message);
       }

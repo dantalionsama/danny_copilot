@@ -269,6 +269,7 @@ export function setup(ctx) {
   let previewTimer = 0;
   let ctxSections = null;
   let ctxUseChat = false;
+  let ctxNotes = [];
   let ctxOpen = false;
   const openIds = new Set();
   let settings = {
@@ -277,6 +278,8 @@ export function setup(ctx) {
     connectionId: "",
     includeCard: true,
     includePersona: true,
+    includeLore: false,
+    loreBudget: 1500,
     systemPrompt: "",
   };
 
@@ -353,11 +356,23 @@ export function setup(ctx) {
   const personaCb = el("input");
   personaCb.type = "checkbox";
   personaRow.append(personaCb, el("span", "", "Include persona"));
+  const loreRow = el("label", "cp-check");
+  const loreCb = el("input");
+  loreCb.type = "checkbox";
+  loreRow.append(loreCb, el("span", "", "Include triggered lorebook entries"));
+  const budgetRow = el("label", "cp-check");
+  const budgetNum = el("input", "cp-num");
+  budgetNum.type = "number";
+  budgetNum.min = "200";
+  budgetNum.max = "8000";
+  budgetNum.step = "100";
+  budgetNum.style.width = "70px";
+  budgetRow.append(el("span", "", "Lorebook budget (tokens)"), budgetNum);
   const promptLabel = el("span", "cp-dim", "System prompt");
   const promptTa = el("textarea");
   const resetBtn = el("button", "cp-btn", "Reset prompt");
   resetBtn.style.alignSelf = "flex-start";
-  setPanel.append(cardRow, personaRow, promptLabel, promptTa, resetBtn);
+  setPanel.append(cardRow, personaRow, loreRow, budgetRow, promptLabel, promptTa, resetBtn);
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
@@ -415,6 +430,12 @@ export function setup(ctx) {
     if (!ctxSections) {
       ctxView.appendChild(el("div", "cp-dim", "Loading…"));
       return;
+    }
+
+    for (const n of ctxNotes) {
+      const d = el("div", "cp-dim", n);
+      d.style.whiteSpace = "normal";
+      ctxView.appendChild(d);
     }
 
     const items = ctxSections.map((s) => ({ id: s.id, label: s.label, text: s.text }));
@@ -481,6 +502,8 @@ export function setup(ctx) {
     ctxRange.value = String(Math.min(50, settings.ctxCount));
     cardCb.checked = !!settings.includeCard;
     personaCb.checked = !!settings.includePersona;
+    loreCb.checked = !!settings.includeLore;
+    budgetNum.value = String(settings.loreBudget);
     promptTa.value = settings.systemPrompt || defaultSystem;
   }
 
@@ -509,6 +532,12 @@ export function setup(ctx) {
   ctxNum.addEventListener("change", () => commitCtx(ctxNum.value));
   cardCb.addEventListener("change", () => { settings.includeCard = cardCb.checked; saveSettings(); });
   personaCb.addEventListener("change", () => { settings.includePersona = personaCb.checked; saveSettings(); });
+  loreCb.addEventListener("change", () => { settings.includeLore = loreCb.checked; saveSettings(); });
+  budgetNum.addEventListener("change", () => {
+    settings.loreBudget = Math.max(200, Math.min(8000, Math.floor(Number(budgetNum.value) || 1500)));
+    budgetNum.value = String(settings.loreBudget);
+    saveSettings();
+  });
   promptTa.addEventListener("change", () => {
     const v = promptTa.value.trim();
     settings.systemPrompt = v === defaultSystem.trim() ? "" : v;
@@ -756,6 +785,7 @@ export function setup(ctx) {
       case "context_preview":
         ctxSections = Array.isArray(p.sections) ? p.sections : [];
         ctxUseChat = !!p.useChat;
+        ctxNotes = Array.isArray(p.notes) ? p.notes : [];
         updateReadout();
         if (ctxOpen) renderContextView();
         break;
