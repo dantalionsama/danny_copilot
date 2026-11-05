@@ -11,7 +11,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
   switch (payload && payload.type) {
     case "init": {
       try {
-        const connections = await spindle.connections.list();
+        const connections = await spindle.connections.list(userId);
         const active = await spindle.chats.getActive();
         spindle.sendToFrontend({
           type: "init",
