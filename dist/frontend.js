@@ -26,6 +26,8 @@ export function setup(ctx) {
   let currentBubble = null;
   let connectionId = "";
   let ctxCount = 10;
+  let currentChatId = undefined;
+  let sendChatId = null;
 
   const removeStyle = ctx.dom.addStyle(STYLES);
 
@@ -60,7 +62,15 @@ export function setup(ctx) {
     ctxCount = Math.max(0, Math.min(200, Number(ctxInput.value) || 0));
   });
   select.addEventListener("change", () => { connectionId = select.value; });
-  row.append(select, ctxLabel, ctxInput);
+  const clearBtn = el("button", "", "Clear");
+  clearBtn.title = "Clear Copilot history for this chat";
+  clearBtn.addEventListener("click", () => {
+    if (busy) return;
+    history = [];
+    renderHistory();
+    saveHistory();
+  });
+  row.append(select, ctxLabel, ctxInput, clearBtn);
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
@@ -81,16 +91,29 @@ export function setup(ctx) {
     return b;
   }
 
+  function renderHistory() {
+    log.replaceChildren();
+    for (const m of history) addBubble(m.role, m.content);
+  }
+
+  function saveHistory() {
+    if (!currentChatId) return;
+    ctx.sendToBackend({ type: "save_history", chatId: currentChatId, history: history.slice(-200) });
+  }
+
   function setBusy(v) {
     busy = v;
     sendBtn.textContent = v ? "Stop" : "Send";
   }
 
   function finish() {
-    if (assistantText) history.push({ role: "assistant", content: assistantText });
+    if (assistantText && sendChatId === currentChatId) {
+      history.push({ role: "assistant", content: assistantText });
+    }
     assistantText = "";
     currentBubble = null;
     setBusy(false);
+    if (sendChatId === currentChatId) saveHistory();
   }
 
   function send() {
@@ -104,10 +127,12 @@ export function setup(ctx) {
     addBubble("user", text);
     currentBubble = addBubble("assistant", "…");
     assistantText = "";
+    sendChatId = currentChatId;
     reqId++;
     setBusy(true);
     ctx.sendToBackend({ type: "send", reqId, text, history: history.slice(-40), ctxCount, connectionId });
     history.push({ role: "user", content: text });
+    saveHistory();
   }
 
   sendBtn.addEventListener("click", send);
@@ -132,6 +157,20 @@ export function setup(ctx) {
         }
         select.value = connectionId;
         chatLine.textContent = p.chat ? "Chat: " + p.chat.name : "No active chat";
+
+        const newId = p.chat ? p.chat.id : null;
+        if (newId !== currentChatId) {
+          if (busy) {
+            ctx.sendToBackend({ type: "stop" });
+            reqId++;
+            assistantText = "";
+            currentBubble = null;
+            setBusy(false);
+          }
+          currentChatId = newId;
+          history = Array.isArray(p.history) ? p.history : [];
+          renderHistory();
+        }
         break;
       }
       case "token":
@@ -154,11 +193,16 @@ export function setup(ctx) {
     }
   });
 
+  const unsubChatSwitch = ctx.events.on("CHAT_SWITCHED", () => {
+    ctx.sendToBackend({ type: "init" });
+  });
+
   tab.onActivate(() => ctx.sendToBackend({ type: "init" }));
   ctx.sendToBackend({ type: "init" });
 
   return () => {
     unsubBackend();
+    unsubChatSwitch();
     removeStyle();
     tab.destroy();
   };
