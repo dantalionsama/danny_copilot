@@ -81,6 +81,52 @@ function personaBlock(p) {
   return `<user_persona name="${p.name}">\n${parts.join("\n\n")}\n</user_persona>`;
 }
 
+// Builds everything that goes into the system message, as labelled sections.
+// Used by both generation and the Context preview so they can never drift apart.
+async function buildContext(userId, settings) {
+  const active = await spindle.chats.getActive(userId);
+  const useChat = settings.mode !== "general" && !!active;
+
+  const sections = [
+    { id: "system", label: "System prompt", text: settings.systemPrompt.trim() || DEFAULT_SYSTEM },
+  ];
+
+  if (useChat) {
+    if (settings.includeCard && active.character_id) {
+      try {
+        const c = await spindle.characters.get(active.character_id, userId);
+        if (c) sections.push({ id: "card", label: `Character card: ${c.name}`, text: cardBlock(c) });
+      } catch (e) {
+        spindle.log.warn("[Copilot] card load failed: " + e.message);
+      }
+    }
+
+    if (settings.includePersona) {
+      try {
+        const p = await spindle.personas.getActive(userId);
+        if (p) sections.push({ id: "persona", label: `Persona: ${p.name}`, text: personaBlock(p) });
+      } catch (e) {
+        spindle.log.warn("[Copilot] persona load failed: " + e.message);
+      }
+    }
+
+    if (settings.ctxCount > 0) {
+      const msgs = await spindle.chat.getMessages(active.id);
+      const recent = msgs.slice(-settings.ctxCount);
+      if (recent.length) {
+        const transcript = recent.map((m) => `[${m.role}] ${m.content}`).join("\n\n");
+        sections.push({
+          id: "chat",
+          label: `Chat messages (${recent.length})`,
+          text: `<roleplay_context>\n${transcript}\n</roleplay_context>`,
+        });
+      }
+    }
+  }
+
+  return { sections, useChat };
+}
+
 spindle.log.info("[Copilot] backend started");
 
 spindle.onFrontendMessage(async (payload, userId) => {
@@ -108,6 +154,17 @@ spindle.onFrontendMessage(async (payload, userId) => {
         }, userId);
       } catch (e) {
         spindle.log.warn("[Copilot] init failed: " + e.message);
+      }
+      break;
+    }
+
+    case "context_preview": {
+      try {
+        const settings = await getSettings(userId);
+        const { sections, useChat } = await buildContext(userId, settings);
+        spindle.sendToFrontend({ type: "context_preview", sections, useChat }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] context preview failed: " + e.message);
       }
       break;
     }
@@ -149,41 +206,10 @@ spindle.onFrontendMessage(async (payload, userId) => {
 
       try {
         const settings = await getSettings(userId);
-        const active = await spindle.chats.getActive(userId);
-        const useChat = settings.mode !== "general" && !!active;
-
-        const blocks = [settings.systemPrompt.trim() || DEFAULT_SYSTEM];
-
-        if (useChat) {
-          if (settings.includeCard && active.character_id) {
-            try {
-              const c = await spindle.characters.get(active.character_id, userId);
-              if (c) blocks.push(cardBlock(c));
-            } catch (e) {
-              spindle.log.warn("[Copilot] card load failed: " + e.message);
-            }
-          }
-          if (settings.includePersona) {
-            try {
-              const p = await spindle.personas.getActive(userId);
-              if (p) blocks.push(personaBlock(p));
-            } catch (e) {
-              spindle.log.warn("[Copilot] persona load failed: " + e.message);
-            }
-          }
-          const n = settings.ctxCount;
-          if (n > 0) {
-            const msgs = await spindle.chat.getMessages(active.id);
-            const transcript = msgs
-              .slice(-n)
-              .map((m) => `[${m.role}] ${m.content}`)
-              .join("\n\n");
-            if (transcript) blocks.push(`<roleplay_context>\n${transcript}\n</roleplay_context>`);
-          }
-        }
+        const { sections } = await buildContext(userId, settings);
 
         const messages = [
-          { role: "system", content: blocks.join("\n\n") },
+          { role: "system", content: sections.map((s) => s.text).join("\n\n") },
           ...cleanHistory(payload.history).slice(-40),
           { role: "user", content: String(payload.text || "") },
         ];

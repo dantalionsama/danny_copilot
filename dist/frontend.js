@@ -12,6 +12,7 @@ const ICONS = {
   stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
   cpu: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
   check: '<polyline points="20 6 9 17 4 12"/>',
+  layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
 };
 
 const STYLES = `
@@ -68,6 +69,8 @@ const STYLES = `
     border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
   .cp-btn:hover { background:var(--cp-fill-hover); }
   .cp-btn.primary { background:var(--cp-primary); border-color:transparent; color:var(--cp-on-primary); }
+  .cp-btn.icon { display:inline-flex; align-items:center; gap:6px; padding:0 10px; }
+  .cp-btn.on { border-color:var(--cp-primary); color:var(--cp-primary); }
 
   .cp-log { flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:2px; scrollbar-width:thin; }
   .cp-wrap { display:flex; flex-direction:column; gap:3px; min-width:0; }
@@ -85,6 +88,22 @@ const STYLES = `
   .cp-act:hover { background:var(--cp-fill-hover); }
   .cp-edit { width:100%; min-height:80px; resize:vertical; padding:8px 10px; line-height:1.4;
     background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
+
+  .cp-foot { justify-content:space-between; }
+  .cp-readout { font-size:11px; color:var(--cp-muted); white-space:nowrap; }
+
+  .cp-ctxview { flex:1; min-height:0; overflow-y:auto; display:none; flex-direction:column; gap:8px; scrollbar-width:thin; }
+  .cp-ctxview.open { display:flex; }
+  .cp-sec { padding:8px 10px; cursor:pointer; background:var(--cp-fill);
+    border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
+  .cp-sec:hover { background:var(--cp-fill-hover); }
+  .cp-sec-top { display:flex; gap:8px; align-items:center; }
+  .cp-sec-name { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .cp-meter { height:4px; margin-top:6px; border-radius:2px; background:var(--cp-fill-hover); overflow:hidden; }
+  .cp-meter-fill { height:100%; background:var(--cp-primary); border-radius:2px; }
+  .cp-pre { margin:8px 0 0; padding:8px; max-height:240px; overflow:auto; cursor:text; white-space:pre-wrap;
+    word-break:break-word; font-family:var(--lumiverse-font-mono, monospace); font-size:11px; line-height:1.45;
+    background:var(--cp-fill-hover); border-radius:8px; }
 
   .cp-inputbar { display:flex; align-items:flex-end; gap:8px; }
   .cp-input { flex:1; min-width:0; resize:none; min-height:38px; max-height:140px; padding:9px 14px; line-height:1.4;
@@ -229,6 +248,9 @@ async function copyText(text) {
   }
 }
 
+const est = (s) => Math.ceil(String(s).length / 4);
+const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
+
 // ---------- extension ----------
 export function setup(ctx) {
   console.log("[danny_copilot] frontend setup running");
@@ -244,6 +266,11 @@ export function setup(ctx) {
   let defaultSystem = "";
   let clearArmed = false;
   let clearTimer = 0;
+  let previewTimer = 0;
+  let ctxSections = null;
+  let ctxUseChat = false;
+  let ctxOpen = false;
+  const openIds = new Set();
   let settings = {
     mode: "chat",
     ctxCount: 10,
@@ -334,6 +361,15 @@ export function setup(ctx) {
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
+  const ctxView = el("div", "cp-ctxview");
+
+  // footer: context button + readout
+  const foot = el("div", "cp-row cp-foot");
+  const ctxBtn = el("button", "cp-btn icon");
+  ctxBtn.innerHTML = svg(ICONS.layers, 14) + "<span>Context</span>";
+  ctxBtn.title = "See exactly what gets sent to the model";
+  const readout = el("span", "cp-readout", "");
+  foot.append(ctxBtn, readout);
 
   // input
   const inputBar = el("div", "cp-inputbar");
@@ -343,7 +379,7 @@ export function setup(ctx) {
   const sendBtn = el("button", "cp-send");
   inputBar.append(input, sendBtn);
 
-  root.append(topRow, connRow, setPanel, chatLine, log, inputBar);
+  root.append(topRow, connRow, setPanel, chatLine, log, ctxView, foot, inputBar);
   tab.root.appendChild(root);
 
   input.addEventListener("input", () => {
@@ -351,9 +387,92 @@ export function setup(ctx) {
     input.style.height = Math.min(input.scrollHeight, 140) + "px";
   });
 
+  // ---------- context view ----------
+  function requestPreview() {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => ctx.sendToBackend({ type: "context_preview" }), 150);
+  }
+
+  function convoText() {
+    return history.slice(-40).map((m) => `[${m.role}] ${m.content}`).join("\n\n");
+  }
+
+  function totalTokens() {
+    let total = 0;
+    for (const s of ctxSections || []) total += est(s.text);
+    total += est(convoText());
+    return total;
+  }
+
+  function updateReadout() {
+    readout.textContent = ctxSections
+      ? `~${fmt(totalTokens())} tkns · ${history.length} msgs`
+      : `${history.length} msgs`;
+  }
+
+  function renderContextView() {
+    ctxView.replaceChildren();
+    if (!ctxSections) {
+      ctxView.appendChild(el("div", "cp-dim", "Loading…"));
+      return;
+    }
+
+    const items = ctxSections.map((s) => ({ id: s.id, label: s.label, text: s.text }));
+    const convo = history.slice(-40);
+    if (convo.length) {
+      items.push({ id: "convo", label: `Copilot conversation (${convo.length})`, text: convoText() });
+    }
+    const total = items.reduce((a, it) => a + est(it.text), 0);
+
+    ctxView.appendChild(
+      el("div", "cp-dim", `Sent with your next message · ~${fmt(total)} tokens (rough estimate)`),
+    );
+    if (!ctxUseChat) {
+      ctxView.appendChild(el("div", "cp-dim", "General mode: no chat context is included."));
+    }
+
+    for (const it of items) {
+      const t = est(it.text);
+      const sec = el("div", "cp-sec");
+      const top = el("div", "cp-sec-top");
+      top.append(el("span", "cp-sec-name", it.label), el("span", "cp-dim", "~" + fmt(t)));
+      const meter = el("div", "cp-meter");
+      const fill = el("div", "cp-meter-fill");
+      fill.style.width = (total ? Math.max(2, Math.round((t / total) * 100)) : 0) + "%";
+      meter.appendChild(fill);
+      sec.append(top, meter);
+      if (openIds.has(it.id)) {
+        const pre = el("pre", "cp-pre");
+        pre.textContent = it.text;
+        sec.appendChild(pre);
+      }
+      sec.addEventListener("click", (e) => {
+        if (e.target.closest(".cp-pre")) return;
+        if (openIds.has(it.id)) openIds.delete(it.id);
+        else openIds.add(it.id);
+        renderContextView();
+      });
+      ctxView.appendChild(sec);
+    }
+  }
+
+  function setCtxOpen(v) {
+    ctxOpen = v;
+    ctxView.classList.toggle("open", v);
+    log.style.display = v ? "none" : "";
+    ctxBtn.classList.toggle("on", v);
+    if (v) {
+      requestPreview();
+      renderContextView();
+    }
+  }
+
+  ctxBtn.addEventListener("click", () => setCtxOpen(!ctxOpen));
+
   // ---------- settings ----------
   function saveSettings() {
     ctx.sendToBackend({ type: "save_settings", settings });
+    requestPreview();
   }
 
   function syncSettingsUI() {
@@ -480,6 +599,8 @@ export function setup(ctx) {
     log.replaceChildren();
     history.forEach((m, i) => log.appendChild(buildMessage(i, m)));
     log.scrollTop = log.scrollHeight;
+    updateReadout();
+    if (ctxOpen) renderContextView();
   }
 
   clearBtn.addEventListener("click", () => {
@@ -557,6 +678,7 @@ export function setup(ctx) {
     if (!text) return;
     input.value = "";
     input.style.height = "auto";
+    if (ctxOpen) setCtxOpen(false);
     const prior = history.slice();
     history.push({ role: "user", content: text });
     saveHistory();
@@ -583,89 +705,4 @@ export function setup(ctx) {
     }
   });
 
-  // ---------- backend messages ----------
-  const unsubBackend = ctx.onBackendMessage((p) => {
-    switch (p && p.type) {
-      case "init": {
-        if (p.settings) settings = p.settings;
-        if (typeof p.defaultSystem === "string") defaultSystem = p.defaultSystem;
-
-        connSelect.replaceChildren();
-        const def = el("option", "", "Active connection");
-        def.value = "";
-        connSelect.appendChild(def);
-        for (const c of p.connections || []) {
-          const o = el("option", "", `${c.name} (${c.model})`);
-          o.value = c.id;
-          connSelect.appendChild(o);
-        }
-        connSelect.value = settings.connectionId;
-        if (connSelect.value !== settings.connectionId) {
-          settings.connectionId = "";
-          connSelect.value = "";
-        }
-        syncSettingsUI();
-
-        const general = settings.mode === "general" || !p.chat;
-        chatLine.textContent =
-          settings.mode === "general"
-            ? "General chat (no chat context)"
-            : p.chat
-              ? "Chat: " + p.chat.name
-              : "No active chat, using General";
-        input.placeholder = general ? "Ask anything…" : "Ask about the roleplay…";
-
-        if (p.sessionKey !== currentKey) {
-          if (busy) {
-            ctx.sendToBackend({ type: "stop" });
-            reqId++;
-            if (raf) { cancelAnimationFrame(raf); raf = 0; }
-            assistantText = "";
-            currentBubble = null;
-            setBusy(false);
-          }
-          currentKey = p.sessionKey;
-          history = Array.isArray(p.history) ? p.history : [];
-          renderHistory();
-        }
-        break;
-      }
-      case "token":
-        if (p.reqId !== reqId || !currentBubble) return;
-        assistantText += p.token;
-        if (!raf) raf = requestAnimationFrame(paintStream);
-        break;
-      case "done":
-      case "stopped":
-        if (p.reqId !== reqId) return;
-        finish();
-        break;
-      case "error": {
-        if (p.reqId !== reqId) return;
-        assistantText = "";
-        finish();
-        const w = el("div", "cp-wrap assistant");
-        w.appendChild(el("div", "cp-msg assistant", "Error: " + p.message));
-        log.appendChild(w);
-        log.scrollTop = log.scrollHeight;
-        break;
-      }
-    }
-  });
-
-  const unsubChatSwitch = ctx.events.on("CHAT_SWITCHED", () => {
-    ctx.sendToBackend({ type: "init" });
-  });
-
-  tab.onActivate(() => ctx.sendToBackend({ type: "init" }));
-  ctx.sendToBackend({ type: "init" });
-
-  return () => {
-    if (raf) cancelAnimationFrame(raf);
-    clearTimeout(clearTimer);
-    unsubBackend();
-    unsubChatSwitch();
-    removeStyle();
-    tab.destroy();
-  };
-}
+  // ---------- backend messages
