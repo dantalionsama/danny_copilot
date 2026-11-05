@@ -1,6 +1,6 @@
 type Msg = { role: 'user' | 'assistant'; content: string }
 
-export function setup(ctx: any) {
+function mount(ctx: any): () => void {
   const COLLAPSED = { w: 48, h: 48 }
   const EXPANDED = { w: 380, h: 520 }
 
@@ -163,5 +163,28 @@ export function setup(ctx: any) {
   return () => {
     unsub()
     widget.destroy()
+  }
+}
+
+export function setup(ctx: any) {
+  console.log('[danny_copilot] frontend setup running')
+  let cleanup: (() => void) | null = null
+
+  const start = () => {
+    if (cleanup) return
+    try {
+      cleanup = mount(ctx)
+      console.log('[danny_copilot] widget mounted')
+    } catch (e) {
+      console.error('[danny_copilot] widget failed:', e)
+    }
+  }
+
+  start()
+  try { ctx.events?.on?.('PERMISSION_CHANGED', start) } catch {}
+
+  return () => {
+    cleanup?.()
+    cleanup = null
   }
 }
