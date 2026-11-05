@@ -12,7 +12,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
     case "init": {
       try {
         const connections = await spindle.connections.list(userId);
-        const active = await spindle.chats.getActive();
+        const active = await spindle.chats.getActive(userId);
         spindle.sendToFrontend({
           type: "init",
           connections: connections.map((c) => ({
@@ -41,7 +41,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
 
       try {
         let transcript = "";
-        const active = await spindle.chats.getActive();
+        const active = await spindle.chats.getActive(userId);
         if (active) {
           const msgs = await spindle.chat.getMessages(active.id);
           const n = Math.max(0, Math.min(200, Number(payload.ctxCount) || 0));
@@ -64,7 +64,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
           { role: "user", content: String(payload.text || "") },
         ];
 
-        const input = { messages, signal: ctl.signal };
+        const input = { type: "quiet", messages, userId, signal: ctl.signal };
         if (payload.connectionId) input.connection_id = payload.connectionId;
 
         for await (const chunk of spindle.generate.quietStream(input)) {
