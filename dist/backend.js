@@ -1,12 +1,24 @@
-const SYSTEM = `You are Copilot, an out-of-character (OOC) assistant for a roleplay writer.
+const DEFAULT_SYSTEM = `You are Copilot, an out-of-character (OOC) assistant for a roleplay writer.
 Help with brainstorming, plot ideas, character analysis, lore and scene review.
 Never write dialogue or actions for the user's character, and never continue the roleplay.
 Be concise and direct.`;
 
-let controller = null;
+const DEFAULTS = {
+  mode: "chat",
+  ctxCount: 10,
+  connectionId: "",
+  includeCard: true,
+  includePersona: true,
+  systemPrompt: "",
+};
 
-const histPath = (chatId) =>
-  `copilot_history_${String(chatId).replace(/[^a-zA-Z0-9_-]/g, "")}.json`;
+let controller = null;
+const cache = {};
+const uk = (userId) => userId || "_";
+const clip = (s, n) => String(s || "").slice(0, n);
+
+const histPath = (key) =>
+  `copilot_history_${String(key).replace(/[^a-zA-Z0-9_-]/g, "")}.json`;
 
 function cleanHistory(raw) {
   return (Array.isArray(raw) ? raw : [])
@@ -14,14 +26,59 @@ function cleanHistory(raw) {
     .map((m) => ({ role: m.role, content: m.content }));
 }
 
-async function loadHistory(chatId, userId) {
+function cleanSettings(s) {
+  const o = { ...DEFAULTS };
+  if (s && typeof s === "object") {
+    if (s.mode === "chat" || s.mode === "general") o.mode = s.mode;
+    const n = Number(s.ctxCount);
+    if (Number.isFinite(n)) o.ctxCount = Math.max(0, Math.min(200, Math.floor(n)));
+    if (typeof s.connectionId === "string") o.connectionId = s.connectionId;
+    o.includeCard = s.includeCard !== false;
+    o.includePersona = s.includePersona !== false;
+    if (typeof s.systemPrompt === "string") o.systemPrompt = s.systemPrompt.slice(0, 8000);
+  }
+  return o;
+}
+
+async function getSettings(userId) {
+  if (cache[uk(userId)]) return cache[uk(userId)];
+  let raw = {};
   try {
-    const h = await spindle.userStorage.getJson(histPath(chatId), { fallback: [], userId });
+    raw = await spindle.userStorage.getJson("copilot_settings.json", { fallback: {}, userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] load settings failed: " + e.message);
+  }
+  const s = cleanSettings(raw);
+  cache[uk(userId)] = s;
+  return s;
+}
+
+async function loadHistory(key, userId) {
+  try {
+    const h = await spindle.userStorage.getJson(histPath(key), { fallback: [], userId });
     return cleanHistory(h);
   } catch (e) {
     spindle.log.warn("[Copilot] load history failed: " + e.message);
     return [];
   }
+}
+
+function cardBlock(c) {
+  const parts = [
+    ["Description", c.description],
+    ["Personality", c.personality],
+    ["Scenario", c.scenario],
+  ]
+    .filter(([, v]) => v && String(v).trim())
+    .map(([k, v]) => `${k}: ${clip(v, 6000)}`);
+  return `<character_card name="${c.name}">\n${parts.join("\n\n")}\n</character_card>`;
+}
+
+function personaBlock(p) {
+  const parts = [];
+  if (p.title) parts.push(`Title: ${clip(p.title, 500)}`);
+  if (p.description) parts.push(`Description: ${clip(p.description, 6000)}`);
+  return `<user_persona name="${p.name}">\n${parts.join("\n\n")}\n</user_persona>`;
 }
 
 spindle.log.info("[Copilot] backend started");
@@ -30,9 +87,11 @@ spindle.onFrontendMessage(async (payload, userId) => {
   switch (payload && payload.type) {
     case "init": {
       try {
+        const settings = await getSettings(userId);
         const connections = await spindle.connections.list(userId);
         const active = await spindle.chats.getActive(userId);
-        const history = active ? await loadHistory(active.id, userId) : [];
+        const key = settings.mode === "general" || !active ? "general" : active.id;
+        const history = await loadHistory(key, userId);
         spindle.sendToFrontend({
           type: "init",
           connections: connections.map((c) => ({
@@ -42,7 +101,10 @@ spindle.onFrontendMessage(async (payload, userId) => {
             is_default: c.is_default,
           })),
           chat: active ? { id: active.id, name: active.name } : null,
+          sessionKey: key,
           history,
+          settings,
+          defaultSystem: DEFAULT_SYSTEM,
         }, userId);
       } catch (e) {
         spindle.log.warn("[Copilot] init failed: " + e.message);
@@ -50,11 +112,22 @@ spindle.onFrontendMessage(async (payload, userId) => {
       break;
     }
 
+    case "save_settings": {
+      const s = cleanSettings(payload.settings);
+      cache[uk(userId)] = s;
+      try {
+        await spindle.userStorage.setJson("copilot_settings.json", s, { userId });
+      } catch (e) {
+        spindle.log.warn("[Copilot] save settings failed: " + e.message);
+      }
+      break;
+    }
+
     case "save_history": {
-      if (!payload.chatId) break;
+      if (!payload.key) break;
       try {
         await spindle.userStorage.setJson(
-          histPath(payload.chatId),
+          histPath(payload.key),
           cleanHistory(payload.history).slice(-200),
           { userId },
         );
@@ -75,30 +148,48 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const reqId = payload.reqId;
 
       try {
-        let transcript = "";
+        const settings = await getSettings(userId);
         const active = await spindle.chats.getActive(userId);
-        if (active) {
-          const msgs = await spindle.chat.getMessages(active.id);
-          const n = Math.max(0, Math.min(200, Number(payload.ctxCount) || 0));
-          const recent = n > 0 ? msgs.slice(-n) : [];
-          transcript = recent.map((m) => `[${m.role}] ${m.content}`).join("\n\n");
+        const useChat = settings.mode !== "general" && !!active;
+
+        const blocks = [settings.systemPrompt.trim() || DEFAULT_SYSTEM];
+
+        if (useChat) {
+          if (settings.includeCard && active.character_id) {
+            try {
+              const c = await spindle.characters.get(active.character_id, userId);
+              if (c) blocks.push(cardBlock(c));
+            } catch (e) {
+              spindle.log.warn("[Copilot] card load failed: " + e.message);
+            }
+          }
+          if (settings.includePersona) {
+            try {
+              const p = await spindle.personas.getActive(userId);
+              if (p) blocks.push(personaBlock(p));
+            } catch (e) {
+              spindle.log.warn("[Copilot] persona load failed: " + e.message);
+            }
+          }
+          const n = settings.ctxCount;
+          if (n > 0) {
+            const msgs = await spindle.chat.getMessages(active.id);
+            const transcript = msgs
+              .slice(-n)
+              .map((m) => `[${m.role}] ${m.content}`)
+              .join("\n\n");
+            if (transcript) blocks.push(`<roleplay_context>\n${transcript}\n</roleplay_context>`);
+          }
         }
 
-        const history = cleanHistory(payload.history).slice(-40);
-
         const messages = [
-          {
-            role: "system",
-            content: transcript
-              ? `${SYSTEM}\n\n<roleplay_context>\n${transcript}\n</roleplay_context>`
-              : SYSTEM,
-          },
-          ...history,
+          { role: "system", content: blocks.join("\n\n") },
+          ...cleanHistory(payload.history).slice(-40),
           { role: "user", content: String(payload.text || "") },
         ];
 
         const input = { type: "quiet", messages, userId, signal: ctl.signal };
-        if (payload.connectionId) input.connection_id = payload.connectionId;
+        if (settings.connectionId) input.connection_id = settings.connectionId;
 
         for await (const chunk of spindle.generate.quietStream(input)) {
           if (chunk.type === "token") {

@@ -1,12 +1,12 @@
 {
-  "version": "0.1.0",
+  "version": "1.0.0",
   "name": "Danny Copilot",
   "identifier": "danny_copilot",
   "author": "dantalionsama",
   "github": "https://github.com/dantalionsama/danny_copilot",
   "homepage": "https://github.com/dantalionsama/danny_copilot",
   "description": "OOC meta-assistant for brainstorming and lore, ported from ST-Copilot.",
-  "permissions": ["generation", "chats", "chat_mutation"],
+  "permissions": ["generation", "chats", "chat_mutation", "characters", "personas"],
   "entry_backend": "dist/backend.js",
   "entry_frontend": "dist/frontend.js"
 }
