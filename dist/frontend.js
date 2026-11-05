@@ -705,4 +705,97 @@ export function setup(ctx) {
     }
   });
 
-  // ---------- backend messages
+  // ---------- backend messages ----------
+  const unsubBackend = ctx.onBackendMessage((p) => {
+    switch (p && p.type) {
+      case "init": {
+        if (p.settings) settings = p.settings;
+        if (typeof p.defaultSystem === "string") defaultSystem = p.defaultSystem;
+
+        connSelect.replaceChildren();
+        const def = el("option", "", "Active connection");
+        def.value = "";
+        connSelect.appendChild(def);
+        for (const c of p.connections || []) {
+          const o = el("option", "", `${c.name} (${c.model})`);
+          o.value = c.id;
+          connSelect.appendChild(o);
+        }
+        connSelect.value = settings.connectionId;
+        if (connSelect.value !== settings.connectionId) {
+          settings.connectionId = "";
+          connSelect.value = "";
+        }
+        syncSettingsUI();
+
+        const general = settings.mode === "general" || !p.chat;
+        chatLine.textContent =
+          settings.mode === "general"
+            ? "General chat (no chat context)"
+            : p.chat
+              ? "Chat: " + p.chat.name
+              : "No active chat, using General";
+        input.placeholder = general ? "Ask anything…" : "Ask about the roleplay…";
+
+        if (p.sessionKey !== currentKey) {
+          if (busy) {
+            ctx.sendToBackend({ type: "stop" });
+            reqId++;
+            if (raf) { cancelAnimationFrame(raf); raf = 0; }
+            assistantText = "";
+            currentBubble = null;
+            setBusy(false);
+          }
+          currentKey = p.sessionKey;
+          history = Array.isArray(p.history) ? p.history : [];
+          renderHistory();
+        }
+        requestPreview();
+        break;
+      }
+      case "context_preview":
+        ctxSections = Array.isArray(p.sections) ? p.sections : [];
+        ctxUseChat = !!p.useChat;
+        updateReadout();
+        if (ctxOpen) renderContextView();
+        break;
+      case "token":
+        if (p.reqId !== reqId || !currentBubble) return;
+        assistantText += p.token;
+        if (!raf) raf = requestAnimationFrame(paintStream);
+        break;
+      case "done":
+      case "stopped":
+        if (p.reqId !== reqId) return;
+        finish();
+        break;
+      case "error": {
+        if (p.reqId !== reqId) return;
+        assistantText = "";
+        finish();
+        const w = el("div", "cp-wrap assistant");
+        w.appendChild(el("div", "cp-msg assistant", "Error: " + p.message));
+        log.appendChild(w);
+        log.scrollTop = log.scrollHeight;
+        break;
+      }
+    }
+  });
+
+  const unsubChatSwitch = ctx.events.on("CHAT_SWITCHED", () => {
+    ctx.sendToBackend({ type: "init" });
+  });
+
+  tab.onActivate(() => ctx.sendToBackend({ type: "init" }));
+  ctx.sendToBackend({ type: "init" });
+
+  return () => {
+    if (raf) cancelAnimationFrame(raf);
+    clearTimeout(clearTimer);
+    clearTimeout(previewTimer);
+    unsubBackend();
+    unsubChatSwitch();
+    removeStyle();
+    tab.destroy();
+  };
+}
