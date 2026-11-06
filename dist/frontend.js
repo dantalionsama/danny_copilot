@@ -119,6 +119,23 @@ const STYLES = `
   .cp-act.pinned { color:var(--cp-primary); }
   .cp-act.pinned svg { fill:currentColor; }
 
+  .cp-top, .cp-bottom { position:sticky; z-index:5; display:flex; flex-direction:column; gap:8px;
+    background:var(--lumiverse-bg, #101014);
+    background:color-mix(in srgb, var(--lumiverse-bg, #101014) 90%, transparent);
+    -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px); }
+  .cp-top { top:0; margin:-10px -10px 0; padding:10px 10px 8px; }
+  .cp-bottom { bottom:0; margin:0 -10px -10px; padding:8px 10px 10px; }
+
+  .cp-plist { max-height:300px; overflow-y:auto; display:flex; flex-direction:column; gap:2px; scrollbar-width:thin; }
+  .cp-prow { display:flex; gap:6px; align-items:flex-start; padding:3px 4px; border-radius:6px; cursor:pointer; }
+  .cp-prow:hover { background:var(--cp-fill-hover); }
+  .cp-prow input { accent-color:var(--cp-primary); flex:none; margin:2px 0 0; pointer-events:none; }
+  .cp-prow.off .cp-ptext { opacity:0.5; }
+  .cp-prow.start { outline:1px solid var(--cp-primary); }
+  .cp-ptag { flex:none; width:26px; padding-top:2px; font-size:10px; text-transform:uppercase; color:var(--cp-muted); }
+  .cp-ptext { flex:1; min-width:0; font-size:12px; line-height:1.35; word-break:break-word; overflow:hidden;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+
   .cp-inputbar { display:flex; align-items:flex-end; gap:8px; }
   .cp-input { flex:1; min-width:0; resize:none; min-height:38px; max-height:140px; padding:9px 14px; line-height:1.4;
     background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:19px; }
@@ -288,6 +305,11 @@ export function setup(ctx) {
   let ctxNotes = [];
   let ctxLore = [];
   let ctxOpen = false;
+  let ctxMsgs = null;
+  let msgLimit = 60;
+  let rangeArmed = false;
+  let rangeStart = null;
+  let pickScrollTop = null;
   let sessions = { active: null, list: [] };
   const openIds = new Set();
   let settings = {
@@ -435,7 +457,11 @@ export function setup(ctx) {
   const sendBtn = el("button", "cp-send");
   inputBar.append(input, sendBtn);
 
-  root.append(topRow, connRow, sessRow, setPanel, chatLine, log, ctxView, foot, inputBar);
+  const topGroup = el("div", "cp-top");
+  topGroup.append(topRow, connRow, sessRow);
+  const bottomGroup = el("div", "cp-bottom");
+  bottomGroup.append(foot, inputBar);
+  root.append(topGroup, setPanel, chatLine, log, ctxView, bottomGroup);
   tab.root.appendChild(root);
 
   input.addEventListener("input", () => {
@@ -509,7 +535,7 @@ export function setup(ctx) {
   // ---------- context view ----------
   function requestPreview() {
     clearTimeout(previewTimer);
-    previewTimer = setTimeout(() => ctx.sendToBackend({ type: "context_preview" }), 150);
+    previewTimer = setTimeout(() => ctx.sendToBackend({ type: "context_preview", msgLimit }), 150);
   }
 
   function convoText() {
@@ -609,6 +635,87 @@ export function setup(ctx) {
     return box;
   }
 
+  function pickGroupEl() {
+    const m = ctxMsgs;
+    const box = el("div", "cp-lore");
+    const head = el("div", "cp-lore-head");
+    const how = m.mode === "manual" ? "hand-picked" : "last " + settings.ctxCount;
+    head.appendChild(el("span", "cp-sec-name", `Chat messages · ${m.selected} of ${m.total} (${how})`));
+
+    const mk = (label, title, fn, on) => {
+      const b = el("button", "cp-btn" + (on ? " on" : ""), label);
+      b.style.cssText = "height:24px;padding:0 8px;font-size:11px;";
+      b.title = title;
+      b.addEventListener("click", fn);
+      return b;
+    };
+    head.append(
+      mk("Auto", "Back to the last N messages (CTX slider)", () =>
+        ctx.sendToBackend({ type: "pick_set", action: "auto" })),
+      mk("None", "Deselect every message", () =>
+        ctx.sendToBackend({ type: "pick_set", action: "none" })),
+      mk("Range", "Tap a first and last message to select everything between", () => {
+        rangeArmed = !rangeArmed;
+        rangeStart = null;
+        renderContextView();
+      }, rangeArmed),
+    );
+    box.appendChild(head);
+
+    if (rangeArmed) {
+      box.appendChild(
+        el("div", "cp-dim", rangeStart ? "Now tap the last message." : "Tap the first message of the range."),
+      );
+    }
+
+    const list = el("div", "cp-plist");
+    if (m.total > m.items.length) {
+      const more = el("button", "cp-btn", `Show older (${m.total - m.items.length} more)`);
+      more.style.cssText = "height:24px;font-size:11px;align-self:center;";
+      more.addEventListener("click", () => {
+        msgLimit += 60;
+        requestPreview();
+      });
+      list.appendChild(more);
+    }
+
+    for (const x of m.items) {
+      const row = el("div", "cp-prow" + (x.sel ? "" : " off") + (rangeStart === x.id ? " start" : ""));
+      const cb = el("input");
+      cb.type = "checkbox";
+      cb.checked = x.sel;
+      const tag = x.role === "user" ? "you" : x.role === "assistant" ? "ai" : "sys";
+      row.append(
+        cb,
+        el("span", "cp-ptag", tag),
+        el("span", "cp-ptext", x.preview || "(empty)"),
+        el("span", "cp-dim", "~" + fmt(x.tokens)),
+      );
+      row.addEventListener("click", () => {
+        if (rangeArmed) {
+          if (rangeStart === null) {
+            rangeStart = x.id;
+            renderContextView();
+          } else {
+            ctx.sendToBackend({ type: "pick_range", from: rangeStart, to: x.id });
+            rangeArmed = false;
+            rangeStart = null;
+          }
+          return;
+        }
+        ctx.sendToBackend({ type: "pick_toggle", id: x.id, on: !x.sel });
+      });
+      list.appendChild(row);
+    }
+
+    list.addEventListener("scroll", () => { pickScrollTop = list.scrollTop; });
+    box.appendChild(list);
+    requestAnimationFrame(() => {
+      list.scrollTop = pickScrollTop === null ? list.scrollHeight : pickScrollTop;
+    });
+    return box;
+  }
+
   function renderContextView() {
     ctxView.replaceChildren();
     if (!ctxSections) {
@@ -618,14 +725,10 @@ export function setup(ctx) {
 
     const isLore = (s) => /^lore\d+$/.test(s.id);
     const items = ctxSections
-      .filter((s) => !isLore(s))
+      .filter((s) => !isLore(s) && s.id !== "chat")
       .map((s) => ({ id: s.id, label: s.label, text: s.text }));
     const convo = history.slice(-40);
-    if (convo.length) {
-      items.push({ id: "convo", label: `Copilot conversation (${convo.length})`, text: convoText() });
-    }
-    const loreTokens = ctxSections.filter(isLore).reduce((a, s) => a + est(s.text), 0);
-    const total = items.reduce((a, it) => a + est(it.text), 0) + loreTokens;
+    const total = totalTokens();
 
     ctxView.appendChild(
       el("div", "cp-dim", `Sent with your next message · ~${fmt(total)} tokens (rough estimate)`),
@@ -639,15 +742,14 @@ export function setup(ctx) {
       ctxView.appendChild(d);
     }
 
-    let loreDone = !ctxLore.length;
-    for (const it of items) {
-      if (!loreDone && (it.id === "chat" || it.id === "convo")) {
-        ctxView.appendChild(loreGroupEl());
-        loreDone = true;
-      }
-      ctxView.appendChild(secEl(it, total));
+    for (const it of items) ctxView.appendChild(secEl(it, total));
+    if (ctxLore.length) ctxView.appendChild(loreGroupEl());
+    if (ctxMsgs) ctxView.appendChild(pickGroupEl());
+    if (convo.length) {
+      ctxView.appendChild(
+        secEl({ id: "convo", label: `Copilot conversation (${convo.length})`, text: convoText() }, total),
+      );
     }
-    if (!loreDone) ctxView.appendChild(loreGroupEl());
   }
 
   function setCtxOpen(v) {
@@ -656,6 +758,9 @@ export function setup(ctx) {
     log.style.display = v ? "none" : "";
     ctxBtn.classList.toggle("on", v);
     if (v) {
+      pickScrollTop = null;
+      rangeArmed = false;
+      rangeStart = null;
       requestPreview();
       renderContextView();
     }

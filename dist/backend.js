@@ -27,7 +27,9 @@ let controller = null;
 const cache = {};
 const loreCache = new Map();
 const lorePrefsCache = new Map();
+const pickCache = new Map();
 const sessCache = new Map();
+const limitCache = {};
 const uk = (userId) => userId || "_";
 const clip = (s, n) => String(s || "").slice(0, n);
 const san = (s) => String(s).replace(/[^a-zA-Z0-9_-]/g, "");
@@ -37,6 +39,7 @@ const histPath = (key) => `copilot_history_${san(key)}.json`;
 const idxPath = (key) => `copilot_sessions_${san(key)}.json`;
 const sessPath = (key, sid) => (sid === "s1" ? histPath(key) : `copilot_hist_${san(key)}_${san(sid)}.json`);
 const lorePath = (chatId) => `copilot_lore_${san(chatId)}.json`;
+const pickPath = (chatId) => `copilot_pick_${san(chatId)}.json`;
 
 function cleanHistory(raw) {
   return (Array.isArray(raw) ? raw : [])
@@ -82,6 +85,15 @@ async function loadHistory(path, userId) {
   } catch (e) {
     spindle.log.warn("[Copilot] load history failed: " + e.message);
     return [];
+  }
+}
+
+// Lighter read: active swipe only, no extra data. Falls back to a plain read if unsupported.
+async function readMessages(chatId) {
+  try {
+    return await spindle.chat.getMessages(chatId, { light: true, includeExtra: false, ownMetadataOnly: true });
+  } catch (e) {
+    return await spindle.chat.getMessages(chatId);
   }
 }
 
@@ -167,6 +179,34 @@ async function saveLorePrefs(chatId, userId, prefs) {
     await spindle.userStorage.setJson(lorePath(chatId), prefs, { userId });
   } catch (e) {
     spindle.log.warn("[Copilot] save lore prefs failed: " + e.message);
+  }
+}
+
+// ---------- per-chat message picks ----------
+// mode "auto": the last N messages (CTX slider). mode "manual": exactly the picked message ids.
+async function getPick(chatId, userId) {
+  const k = `${uk(userId)}|${chatId}`;
+  if (pickCache.has(k)) return pickCache.get(k);
+  let raw = {};
+  try {
+    raw = await spindle.userStorage.getJson(pickPath(chatId), { fallback: {}, userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] load pick failed: " + e.message);
+  }
+  const pick = {
+    mode: raw && raw.mode === "manual" ? "manual" : "auto",
+    ids: (Array.isArray(raw && raw.ids) ? raw.ids : []).filter((x) => typeof x === "string").slice(0, 1000),
+  };
+  pickCache.set(k, pick);
+  return pick;
+}
+
+async function savePick(chatId, userId, pick) {
+  pickCache.set(`${uk(userId)}|${chatId}`, pick);
+  try {
+    await spindle.userStorage.setJson(pickPath(chatId), pick, { userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] save pick failed: " + e.message);
   }
 }
 
@@ -259,7 +299,7 @@ function planLore(blocks, prefs, budgetTokens) {
 
 // Builds everything that goes into the system message, as labelled sections.
 // Used by both generation and the Context preview so they can never drift apart.
-async function buildContext(userId, settings) {
+async function buildContext(userId, settings, opts = {}) {
   const active = await spindle.chats.getActive(userId);
   const useChat = settings.mode !== "general" && !!active;
 
@@ -268,6 +308,7 @@ async function buildContext(userId, settings) {
   ];
   const notes = [];
   let loreItems = [];
+  let msgsInfo = null;
 
   const rule = LENGTH_RULES[settings.length];
   if (rule) {
@@ -297,9 +338,10 @@ async function buildContext(userId, settings) {
       }
     }
 
+    const pick = await getPick(active.id, userId);
     let msgs = [];
-    if (settings.ctxCount > 0 || settings.includeLore) {
-      msgs = await spindle.chat.getMessages(active.id);
+    if (settings.ctxCount > 0 || settings.includeLore || pick.mode === "manual" || opts.withMessages) {
+      msgs = await readMessages(active.id);
     }
 
     if (settings.includeLore) {
@@ -340,16 +382,48 @@ async function buildContext(userId, settings) {
       }
     }
 
-    if (settings.ctxCount > 0) {
-      const recent = msgs.slice(-settings.ctxCount);
-      if (recent.length) {
-        const transcript = recent.map((m) => `[${m.role}] ${m.content}`).join("\n\n");
-        sections.push({
-          id: "chat",
-          label: `Chat messages (${recent.length})`,
-          text: `<roleplay_context>\n${transcript}\n</roleplay_context>`,
-        });
+    // which chat messages are included: hand-picked ids, or the last N
+    let chosen = [];
+    if (pick.mode === "manual") {
+      const set = new Set(pick.ids);
+      chosen = msgs.map((m, i) => ({ m, i })).filter((x) => set.has(String(x.m.id)));
+    } else if (settings.ctxCount > 0) {
+      const start = Math.max(0, msgs.length - settings.ctxCount);
+      chosen = msgs.slice(start).map((m, k) => ({ m, i: start + k }));
+    }
+
+    if (chosen.length) {
+      const parts = [];
+      let prev = -2;
+      for (const x of chosen) {
+        if (prev >= 0 && x.i - prev > 1) parts.push("[…]");
+        parts.push(`[${x.m.role}] ${x.m.content}`);
+        prev = x.i;
       }
+      sections.push({
+        id: "chat",
+        label: `Chat messages (${chosen.length})`,
+        text: `<roleplay_context>\n${parts.join("\n\n")}\n</roleplay_context>`,
+      });
+    }
+
+    if (opts.withMessages) {
+      const sel = new Set(chosen.map((x) => String(x.m.id)));
+      const limit = opts.limit || 60;
+      const startIdx = Math.max(0, msgs.length - limit);
+      msgsInfo = {
+        mode: pick.mode,
+        total: msgs.length,
+        selected: chosen.length,
+        items: msgs.slice(startIdx).map((m, k) => ({
+          id: String(m.id),
+          i: startIdx + k,
+          role: m.role,
+          tokens: Math.ceil(String(m.content).length / 4),
+          preview: String(m.content).replace(/\s+/g, " ").trim().slice(0, 160),
+          sel: sel.has(String(m.id)),
+        })),
+      };
     }
   }
 
@@ -363,13 +437,17 @@ async function buildContext(userId, settings) {
     text: x.text,
   }));
 
-  return { sections, notes, useChat, lore };
+  return { sections, notes, useChat, lore, msgs: msgsInfo };
 }
 
 async function sendPreview(userId) {
   const settings = await getSettings(userId);
-  const { sections, notes, useChat, lore } = await buildContext(userId, settings);
-  spindle.sendToFrontend({ type: "context_preview", sections, notes, useChat, lore }, userId);
+  const limit = limitCache[uk(userId)] || 60;
+  const { sections, notes, useChat, lore, msgs } = await buildContext(userId, settings, {
+    withMessages: true,
+    limit,
+  });
+  spindle.sendToFrontend({ type: "context_preview", sections, notes, useChat, lore, msgs }, userId);
 }
 
 spindle.log.info("[Copilot] backend started");
@@ -455,9 +533,65 @@ spindle.onFrontendMessage(async (payload, userId) => {
 
     case "context_preview": {
       try {
+        const lim = Number(payload.msgLimit);
+        if (Number.isFinite(lim)) limitCache[uk(userId)] = Math.max(20, Math.min(500, Math.floor(lim)));
         await sendPreview(userId);
       } catch (e) {
         spindle.log.warn("[Copilot] context preview failed: " + e.message);
+      }
+      break;
+    }
+
+    case "pick_toggle": {
+      try {
+        const id = String(payload.id || "");
+        const active = await spindle.chats.getActive(userId);
+        if (!id || !active) break;
+        const settings = await getSettings(userId);
+        const pick = await getPick(active.id, userId);
+        let ids = pick.ids;
+        if (pick.mode === "auto") {
+          const msgs = await readMessages(active.id);
+          ids = settings.ctxCount > 0 ? msgs.slice(-settings.ctxCount).map((m) => String(m.id)) : [];
+        }
+        const s = new Set(ids);
+        const on = typeof payload.on === "boolean" ? payload.on : !s.has(id);
+        if (on) s.add(id);
+        else s.delete(id);
+        await savePick(active.id, userId, { mode: "manual", ids: [...s].slice(0, 1000) });
+        await sendPreview(userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] pick_toggle failed: " + e.message);
+      }
+      break;
+    }
+
+    case "pick_set": {
+      try {
+        const active = await spindle.chats.getActive(userId);
+        if (!active) break;
+        const pick = payload.action === "none" ? { mode: "manual", ids: [] } : { mode: "auto", ids: [] };
+        await savePick(active.id, userId, pick);
+        await sendPreview(userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] pick_set failed: " + e.message);
+      }
+      break;
+    }
+
+    case "pick_range": {
+      try {
+        const active = await spindle.chats.getActive(userId);
+        if (!active) break;
+        const msgs = await readMessages(active.id);
+        const a = msgs.findIndex((m) => String(m.id) === String(payload.from));
+        const b = msgs.findIndex((m) => String(m.id) === String(payload.to));
+        if (a < 0 || b < 0) break;
+        const ids = msgs.slice(Math.min(a, b), Math.max(a, b) + 1).map((m) => String(m.id)).slice(0, 1000);
+        await savePick(active.id, userId, { mode: "manual", ids });
+        await sendPreview(userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] pick_range failed: " + e.message);
       }
       break;
     }
