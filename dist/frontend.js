@@ -1059,6 +1059,7 @@ export function setup(ctx) {
         ctxUseChat = !!p.useChat;
         ctxNotes = Array.isArray(p.notes) ? p.notes : [];
         ctxLore = Array.isArray(p.lore) ? p.lore : [];
+        ctxMsgs = p.msgs || null;
         updateReadout();
         if (ctxOpen) renderContextView();
         break;
