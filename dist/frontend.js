@@ -14,6 +14,7 @@ const ICONS = {
   check: '<polyline points="20 6 9 17 4 12"/>',
   layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
   pin: '<line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/>',
+  plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
 };
 
 const STYLES = `
@@ -43,7 +44,10 @@ const STYLES = `
     background-repeat:no-repeat; background-position:right 8px center; text-overflow:ellipsis;
   }
   .cp-sel option { background:var(--lumiverse-bg-elevated, #1a1a1f); color:var(--lumiverse-text, inherit); }
-  .cp-sel:focus, .cp-num:focus, .cp-input:focus, .cp-edit:focus, .cp-set textarea:focus { outline:none; border-color:var(--cp-primary); }
+  .cp-sel:focus, .cp-num:focus, .cp-field:focus, .cp-input:focus, .cp-edit:focus, .cp-set textarea:focus { outline:none; border-color:var(--cp-primary); }
+
+  .cp-field { flex:1; min-width:0; height:30px; padding:0 10px;
+    background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
 
   .cp-ibtn {
     width:30px; height:30px; flex:none; display:grid; place-items:center; padding:0; cursor:pointer;
@@ -85,7 +89,7 @@ const STYLES = `
   .cp-bar { display:flex; gap:2px; align-items:center; opacity:0.5; transition:opacity 0.15s; }
   .cp-wrap:hover .cp-bar, .cp-bar.show { opacity:1; }
   .cp-act { width:24px; height:24px; display:grid; place-items:center; padding:0; background:none;
-    border:none; border-radius:6px; cursor:pointer; color:inherit; }
+    border:none; border-radius:6px; cursor:pointer; color:inherit; flex:none; }
   .cp-act:hover { background:var(--cp-fill-hover); }
   .cp-edit { width:100%; min-height:80px; resize:vertical; padding:8px 10px; line-height:1.4;
     background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
@@ -270,18 +274,21 @@ export function setup(ctx) {
   let history = [];
   let assistantText = "";
   let currentBubble = null;
-  let currentKey = undefined;
+  let currentKey = undefined; // "<chatId or general>|<sessionId>"
+  let currentBase = null;
+  let currentSid = null;
   let sendKey = null;
   let raf = 0;
   let defaultSystem = "";
-  let clearArmed = false;
-  let clearTimer = 0;
+  let delArmed = false;
+  let delTimer = 0;
   let previewTimer = 0;
   let ctxSections = null;
   let ctxUseChat = false;
   let ctxNotes = [];
   let ctxLore = [];
   let ctxOpen = false;
+  let sessions = { active: null, list: [] };
   const openIds = new Set();
   let settings = {
     mode: "chat",
@@ -323,7 +330,7 @@ export function setup(ctx) {
 
   const root = el("div", "cp-root");
 
-  // row 1: mode, CTX slider, settings, clear
+  // row 1: mode, CTX slider, settings
   const topRow = el("div", "cp-row");
   const modeSelect = el("select", "cp-sel");
   modeSelect.style.width = "104px";
@@ -346,8 +353,7 @@ export function setup(ctx) {
   ctxWrap.append(el("span", "", "CTX"), ctxRange);
 
   const settingsBtn = iconBtn(ICONS.sliders, "Settings");
-  const clearBtn = iconBtn(ICONS.trash, "Clear history");
-  topRow.append(modeSelect, ctxWrap, ctxNum, settingsBtn, clearBtn);
+  topRow.append(modeSelect, ctxWrap, ctxNum, settingsBtn);
 
   // row 2: connection
   const connRow = el("div", "cp-row");
@@ -356,15 +362,20 @@ export function setup(ctx) {
   const connSelect = el("select", "cp-sel");
   connSelect.style.flex = "1";
   connSelect.title = "Connection used for Copilot";
-  const lenSelect = el("select", "cp-sel");
-  lenSelect.style.width = "84px";
-  lenSelect.title = "Reply length";
-  for (const [v, t] of [["auto", "Auto"], ["short", "Short"], ["medium", "Medium"], ["long", "Long"]]) {
-    const o = el("option", "", t);
-    o.value = v;
-    lenSelect.appendChild(o);
-  }
-  connRow.append(connIco, connSelect, lenSelect);
+  connRow.append(connIco, connSelect);
+
+  // row 3: sessions
+  const sessRow = el("div", "cp-row");
+  const sessSelect = el("select", "cp-sel");
+  sessSelect.style.flex = "1";
+  sessSelect.title = "Copilot session";
+  const renameInput = el("input", "cp-field");
+  renameInput.style.display = "none";
+  renameInput.maxLength = 60;
+  const newBtn = iconBtn(ICONS.plus, "New session");
+  const renBtn = iconBtn(ICONS.edit, "Rename session");
+  const delBtn = iconBtn(ICONS.trash, "Delete session");
+  sessRow.append(sessSelect, renameInput, newBtn, renBtn, delBtn);
 
   // settings panel
   const setPanel = el("div", "cp-set");
@@ -388,11 +399,21 @@ export function setup(ctx) {
   budgetNum.step = "100";
   budgetNum.style.width = "70px";
   budgetRow.append(el("span", "", "Lorebook budget (tokens)"), budgetNum);
+  const lenRow = el("label", "cp-check");
+  const lenSelect = el("select", "cp-sel");
+  lenSelect.style.width = "120px";
+  lenSelect.title = "Adds a length rule to the system prompt. Auto adds nothing.";
+  for (const [v, t] of [["auto", "Auto"], ["short", "Short"], ["medium", "Medium"], ["long", "Long"]]) {
+    const o = el("option", "", t);
+    o.value = v;
+    lenSelect.appendChild(o);
+  }
+  lenRow.append(el("span", "", "Reply length"), lenSelect);
   const promptLabel = el("span", "cp-dim", "System prompt");
   const promptTa = el("textarea");
   const resetBtn = el("button", "cp-btn", "Reset prompt");
   resetBtn.style.alignSelf = "flex-start";
-  setPanel.append(cardRow, personaRow, loreRow, budgetRow, promptLabel, promptTa, resetBtn);
+  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, promptLabel, promptTa, resetBtn);
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
@@ -414,12 +435,75 @@ export function setup(ctx) {
   const sendBtn = el("button", "cp-send");
   inputBar.append(input, sendBtn);
 
-  root.append(topRow, connRow, setPanel, chatLine, log, ctxView, foot, inputBar);
+  root.append(topRow, connRow, sessRow, setPanel, chatLine, log, ctxView, foot, inputBar);
   tab.root.appendChild(root);
 
   input.addEventListener("input", () => {
     input.style.height = "auto";
     input.style.height = Math.min(input.scrollHeight, 140) + "px";
+  });
+
+  // ---------- sessions ----------
+  function renderSessionSelect() {
+    sessSelect.replaceChildren();
+    for (const s of sessions.list) {
+      const o = el("option", "", s.name);
+      o.value = s.id;
+      sessSelect.appendChild(o);
+    }
+    if (sessions.active) sessSelect.value = sessions.active;
+  }
+
+  sessSelect.addEventListener("change", () => {
+    ctx.sendToBackend({ type: "session_switch", sid: sessSelect.value });
+  });
+  newBtn.addEventListener("click", () => ctx.sendToBackend({ type: "session_new" }));
+
+  function startRename() {
+    const cur = sessions.list.find((s) => s.id === sessions.active);
+    if (!cur) return;
+    renameInput.value = cur.name;
+    sessSelect.style.display = "none";
+    renameInput.style.display = "";
+    renameInput.focus();
+    renameInput.select();
+  }
+  function endRename(save) {
+    if (renameInput.style.display === "none") return;
+    const v = renameInput.value.trim();
+    renameInput.style.display = "none";
+    sessSelect.style.display = "";
+    if (save && v) ctx.sendToBackend({ type: "session_rename", sid: sessions.active, name: v });
+  }
+  renBtn.addEventListener("click", startRename);
+  renameInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); endRename(true); }
+    else if (e.key === "Escape") { e.preventDefault(); endRename(false); }
+  });
+  renameInput.addEventListener("blur", () => endRename(true));
+
+  function disarmDelete() {
+    delArmed = false;
+    clearTimeout(delTimer);
+    delBtn.classList.remove("on");
+    delBtn.title = "Delete session";
+  }
+
+  delBtn.addEventListener("click", () => {
+    if (busy) return;
+    if (!delArmed) {
+      delArmed = true;
+      delBtn.classList.add("on");
+      delBtn.title = "Click again to delete this session";
+      delTimer = setTimeout(disarmDelete, 2500);
+      return;
+    }
+    disarmDelete();
+    if (sessions.list.length <= 1) {
+      history = [];
+      renderHistory();
+    }
+    ctx.sendToBackend({ type: "session_delete", sid: sessions.active });
   });
 
   // ---------- context view ----------
@@ -593,8 +677,8 @@ export function setup(ctx) {
     personaCb.checked = !!settings.includePersona;
     loreCb.checked = !!settings.includeLore;
     budgetNum.value = String(settings.loreBudget);
-    promptTa.value = settings.systemPrompt || defaultSystem;
     lenSelect.value = settings.length || "auto";
+    promptTa.value = settings.systemPrompt || defaultSystem;
   }
 
   function commitCtx(n) {
@@ -617,7 +701,6 @@ export function setup(ctx) {
     settings.connectionId = connSelect.value;
     saveSettings();
   });
-
   lenSelect.addEventListener("change", () => {
     settings.length = lenSelect.value;
     saveSettings();
@@ -646,8 +729,13 @@ export function setup(ctx) {
 
   // ---------- history + rendering ----------
   function saveHistory() {
-    if (!currentKey) return;
-    ctx.sendToBackend({ type: "save_history", key: currentKey, history: history.slice(-200) });
+    if (!currentBase || !currentSid) return;
+    ctx.sendToBackend({
+      type: "save_history",
+      key: currentBase,
+      sid: currentSid,
+      history: history.slice(-200),
+    });
   }
 
   function actBtn(icon, title, fn) {
@@ -725,28 +813,6 @@ export function setup(ctx) {
     log.scrollTop = log.scrollHeight;
     updateReadout();
     if (ctxOpen) renderContextView();
-  }
-
-  clearBtn.addEventListener("click", () => {
-    if (busy) return;
-    if (!clearArmed) {
-      clearArmed = true;
-      clearBtn.classList.add("on");
-      clearBtn.title = "Click again to clear";
-      clearTimer = setTimeout(disarmClear, 2500);
-      return;
-    }
-    disarmClear();
-    history = [];
-    renderHistory();
-    saveHistory();
-  });
-
-  function disarmClear() {
-    clearArmed = false;
-    clearTimeout(clearTimer);
-    clearBtn.classList.remove("on");
-    clearBtn.title = "Clear history";
   }
 
   // ---------- generation ----------
@@ -852,6 +918,9 @@ export function setup(ctx) {
         }
         syncSettingsUI();
 
+        sessions = p.sessions || { active: p.sessionId, list: [] };
+        renderSessionSelect();
+
         const general = settings.mode === "general" || !p.chat;
         chatLine.textContent =
           settings.mode === "general"
@@ -861,7 +930,8 @@ export function setup(ctx) {
               : "No active chat, using General";
         input.placeholder = general ? "Ask anything…" : "Ask about the roleplay…";
 
-        if (p.sessionKey !== currentKey) {
+        const composite = p.sessionKey + "|" + p.sessionId;
+        if (composite !== currentKey) {
           if (busy) {
             ctx.sendToBackend({ type: "stop" });
             reqId++;
@@ -870,7 +940,9 @@ export function setup(ctx) {
             currentBubble = null;
             setBusy(false);
           }
-          currentKey = p.sessionKey;
+          currentKey = composite;
+          currentBase = p.sessionKey;
+          currentSid = p.sessionId;
           history = Array.isArray(p.history) ? p.history : [];
           renderHistory();
         }
@@ -917,7 +989,7 @@ export function setup(ctx) {
 
   return () => {
     if (raf) cancelAnimationFrame(raf);
-    clearTimeout(clearTimer);
+    clearTimeout(delTimer);
     clearTimeout(previewTimer);
     unsubBackend();
     unsubChatSwitch();

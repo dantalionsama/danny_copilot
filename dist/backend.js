@@ -27,13 +27,16 @@ let controller = null;
 const cache = {};
 const loreCache = new Map();
 const lorePrefsCache = new Map();
+const sessCache = new Map();
 const uk = (userId) => userId || "_";
 const clip = (s, n) => String(s || "").slice(0, n);
+const san = (s) => String(s).replace(/[^a-zA-Z0-9_-]/g, "");
 
-const histPath = (key) =>
-  `copilot_history_${String(key).replace(/[^a-zA-Z0-9_-]/g, "")}.json`;
-const lorePath = (chatId) =>
-  `copilot_lore_${String(chatId).replace(/[^a-zA-Z0-9_-]/g, "")}.json`;
+// Session "s1" keeps using the original history file, so old histories carry over untouched.
+const histPath = (key) => `copilot_history_${san(key)}.json`;
+const idxPath = (key) => `copilot_sessions_${san(key)}.json`;
+const sessPath = (key, sid) => (sid === "s1" ? histPath(key) : `copilot_hist_${san(key)}_${san(sid)}.json`);
+const lorePath = (chatId) => `copilot_lore_${san(chatId)}.json`;
 
 function cleanHistory(raw) {
   return (Array.isArray(raw) ? raw : [])
@@ -72,14 +75,74 @@ async function getSettings(userId) {
   return s;
 }
 
-async function loadHistory(key, userId) {
+async function loadHistory(path, userId) {
   try {
-    const h = await spindle.userStorage.getJson(histPath(key), { fallback: [], userId });
+    const h = await spindle.userStorage.getJson(path, { fallback: [], userId });
     return cleanHistory(h);
   } catch (e) {
     spindle.log.warn("[Copilot] load history failed: " + e.message);
     return [];
   }
+}
+
+// ---------- sessions (a list per chat, plus one for General) ----------
+async function getSessions(key, userId) {
+  const ck = `${uk(userId)}|${key}`;
+  if (sessCache.has(ck)) return sessCache.get(ck);
+  let raw = {};
+  try {
+    raw = await spindle.userStorage.getJson(idxPath(key), { fallback: {}, userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] load sessions failed: " + e.message);
+  }
+  const list = (Array.isArray(raw && raw.list) ? raw.list : [])
+    .filter((s) => s && typeof s.id === "string" && san(s.id) && typeof s.name === "string")
+    .map((s) => ({ id: san(s.id), name: s.name.slice(0, 60) || "Session" }))
+    .slice(0, 100);
+  if (!list.length) list.push({ id: "s1", name: "Session 1" });
+  const active = list.some((s) => s.id === (raw && raw.active)) ? raw.active : list[0].id;
+  const idx = { active, list };
+  sessCache.set(ck, idx);
+  return idx;
+}
+
+async function saveSessions(key, userId, idx) {
+  sessCache.set(`${uk(userId)}|${key}`, idx);
+  try {
+    await spindle.userStorage.setJson(idxPath(key), idx, { userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] save sessions failed: " + e.message);
+  }
+}
+
+async function resolveKey(userId) {
+  const settings = await getSettings(userId);
+  const active = await spindle.chats.getActive(userId);
+  const key = settings.mode === "general" || !active ? "general" : active.id;
+  return { settings, active, key };
+}
+
+async function sendInit(userId) {
+  const { settings, active, key } = await resolveKey(userId);
+  const connections = await spindle.connections.list(userId);
+  const sessions = await getSessions(key, userId);
+  const history = await loadHistory(sessPath(key, sessions.active), userId);
+  spindle.sendToFrontend({
+    type: "init",
+    connections: connections.map((c) => ({
+      id: c.id,
+      name: c.name,
+      model: c.model,
+      is_default: c.is_default,
+    })),
+    chat: active ? { id: active.id, name: active.name } : null,
+    sessionKey: key,
+    sessionId: sessions.active,
+    sessions,
+    history,
+    settings,
+    defaultSystem: DEFAULT_SYSTEM,
+  }, userId);
 }
 
 // ---------- per-chat lorebook choices ----------
@@ -315,27 +378,77 @@ spindle.onFrontendMessage(async (payload, userId) => {
   switch (payload && payload.type) {
     case "init": {
       try {
-        const settings = await getSettings(userId);
-        const connections = await spindle.connections.list(userId);
-        const active = await spindle.chats.getActive(userId);
-        const key = settings.mode === "general" || !active ? "general" : active.id;
-        const history = await loadHistory(key, userId);
-        spindle.sendToFrontend({
-          type: "init",
-          connections: connections.map((c) => ({
-            id: c.id,
-            name: c.name,
-            model: c.model,
-            is_default: c.is_default,
-          })),
-          chat: active ? { id: active.id, name: active.name } : null,
-          sessionKey: key,
-          history,
-          settings,
-          defaultSystem: DEFAULT_SYSTEM,
-        }, userId);
+        await sendInit(userId);
       } catch (e) {
         spindle.log.warn("[Copilot] init failed: " + e.message);
+      }
+      break;
+    }
+
+    case "session_new": {
+      try {
+        const { key } = await resolveKey(userId);
+        const idx = await getSessions(key, userId);
+        if (idx.list.length >= 100) break;
+        const id = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+        await saveSessions(key, userId, {
+          active: id,
+          list: [...idx.list, { id, name: `Session ${idx.list.length + 1}` }],
+        });
+        await sendInit(userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] session_new failed: " + e.message);
+      }
+      break;
+    }
+
+    case "session_switch": {
+      try {
+        const { key } = await resolveKey(userId);
+        const idx = await getSessions(key, userId);
+        const sid = String(payload.sid || "");
+        if (!idx.list.some((s) => s.id === sid)) break;
+        await saveSessions(key, userId, { active: sid, list: idx.list });
+        await sendInit(userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] session_switch failed: " + e.message);
+      }
+      break;
+    }
+
+    case "session_rename": {
+      try {
+        const { key } = await resolveKey(userId);
+        const idx = await getSessions(key, userId);
+        const sid = String(payload.sid || "");
+        const name = String(payload.name || "").trim().slice(0, 60);
+        if (!name || !idx.list.some((s) => s.id === sid)) break;
+        await saveSessions(key, userId, {
+          active: idx.active,
+          list: idx.list.map((s) => (s.id === sid ? { id: s.id, name } : s)),
+        });
+        await sendInit(userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] session_rename failed: " + e.message);
+      }
+      break;
+    }
+
+    case "session_delete": {
+      try {
+        const { key } = await resolveKey(userId);
+        const idx = await getSessions(key, userId);
+        const sid = String(payload.sid || "");
+        const pos = idx.list.findIndex((s) => s.id === sid);
+        if (pos < 0) break;
+        await spindle.userStorage.setJson(sessPath(key, sid), [], { userId });
+        let list = idx.list.filter((s) => s.id !== sid);
+        if (!list.length) list = [{ id: "s1", name: "Session 1" }];
+        const active = idx.active === sid ? list[Math.max(0, pos - 1)].id : idx.active;
+        await saveSessions(key, userId, { active, list });
+        await sendInit(userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] session_delete failed: " + e.message);
       }
       break;
     }
@@ -403,10 +516,10 @@ spindle.onFrontendMessage(async (payload, userId) => {
     }
 
     case "save_history": {
-      if (!payload.key) break;
+      if (!payload.key || !payload.sid) break;
       try {
         await spindle.userStorage.setJson(
-          histPath(payload.key),
+          sessPath(payload.key, String(payload.sid)),
           cleanHistory(payload.history).slice(-200),
           { userId },
         );
