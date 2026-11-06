@@ -3,6 +3,14 @@ Help with brainstorming, plot ideas, character analysis, lore and scene review.
 Never write dialogue or actions for the user's character, and never continue the roleplay.
 Be concise and direct.`;
 
+const LENGTH_RULES = {
+  auto: "",
+  short: "Keep replies short: usually 2-6 sentences, under 150 words. No headers or long lists unless the writer asks for more detail.",
+  medium: "Keep replies moderate: a few short paragraphs, under 300 words, unless the writer asks for more detail.",
+  long: "Be thorough and detailed: cover the topic fully and use structure when it helps.",
+};
+const LENGTH_LABELS = { short: "Short", medium: "Medium", long: "Long" };
+
 const DEFAULTS = {
   mode: "chat",
   ctxCount: 10,
@@ -11,17 +19,21 @@ const DEFAULTS = {
   includePersona: true,
   includeLore: false,
   loreBudget: 1500,
+  length: "auto",
   systemPrompt: "",
 };
 
 let controller = null;
 const cache = {};
 const loreCache = new Map();
+const lorePrefsCache = new Map();
 const uk = (userId) => userId || "_";
 const clip = (s, n) => String(s || "").slice(0, n);
 
 const histPath = (key) =>
   `copilot_history_${String(key).replace(/[^a-zA-Z0-9_-]/g, "")}.json`;
+const lorePath = (chatId) =>
+  `copilot_lore_${String(chatId).replace(/[^a-zA-Z0-9_-]/g, "")}.json`;
 
 function cleanHistory(raw) {
   return (Array.isArray(raw) ? raw : [])
@@ -41,6 +53,7 @@ function cleanSettings(s) {
     o.includeLore = s.includeLore === true;
     const lb = Number(s.loreBudget);
     if (Number.isFinite(lb)) o.loreBudget = Math.max(200, Math.min(8000, Math.floor(lb)));
+    if (["auto", "short", "medium", "long"].includes(s.length)) o.length = s.length;
     if (typeof s.systemPrompt === "string") o.systemPrompt = s.systemPrompt.slice(0, 8000);
   }
   return o;
@@ -66,6 +79,31 @@ async function loadHistory(key, userId) {
   } catch (e) {
     spindle.log.warn("[Copilot] load history failed: " + e.message);
     return [];
+  }
+}
+
+// ---------- per-chat lorebook choices ----------
+async function getLorePrefs(chatId, userId) {
+  const k = `${uk(userId)}|${chatId}`;
+  if (lorePrefsCache.has(k)) return lorePrefsCache.get(k);
+  let raw = {};
+  try {
+    raw = await spindle.userStorage.getJson(lorePath(chatId), { fallback: {}, userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] load lore prefs failed: " + e.message);
+  }
+  const strs = (a) => (Array.isArray(a) ? a.filter((x) => typeof x === "string").slice(0, 500) : []);
+  const prefs = { excluded: strs(raw && raw.excluded), pinned: strs(raw && raw.pinned) };
+  lorePrefsCache.set(k, prefs);
+  return prefs;
+}
+
+async function saveLorePrefs(chatId, userId, prefs) {
+  lorePrefsCache.set(`${uk(userId)}|${chatId}`, prefs);
+  try {
+    await spindle.userStorage.setJson(lorePath(chatId), prefs, { userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] save lore prefs failed: " + e.message);
   }
 }
 
@@ -105,27 +143,55 @@ async function getLore(chatId, userId, sig) {
   return entry;
 }
 
-function budgetLore(blocks, budgetTokens) {
+// "World Info Before: Souma Kagetora" -> "Souma Kagetora" (stable even if the entry's position changes)
+function entryLabel(name) {
+  const s = String(name || "");
+  const i = s.indexOf(":");
+  return (i >= 0 ? s.slice(i + 1) : s).trim() || s;
+}
+
+// Decides which triggered entries fit: excluded are dropped, pinned go first and always fit,
+// the rest fill whatever budget is left in their original order.
+function planLore(blocks, prefs, budgetTokens) {
+  const excluded = new Set(prefs.excluded);
+  const pinned = new Set(prefs.pinned);
+  const items = blocks.map((b) => {
+    const key = entryLabel(b.name);
+    return {
+      key,
+      name: b.name,
+      text: b.content,
+      sent: b.content,
+      tokens: Math.ceil(b.content.length / 4),
+      excluded: excluded.has(key),
+      pinned: pinned.has(key),
+      state: "over",
+    };
+  });
+
   let remaining = budgetTokens * 4;
-  let trimmed = false;
-  let skipped = 0;
-  const out = [];
-  for (const b of blocks) {
-    if (remaining <= 0) { skipped++; continue; }
-    let text = b.content;
-    if (text.length > remaining) {
-      let cut = text.slice(0, remaining);
+  const live = items.filter((x) => !x.excluded);
+  const order = [...live.filter((x) => x.pinned), ...live.filter((x) => !x.pinned)];
+  for (const it of order) {
+    if (it.pinned) {
+      it.state = "in";
+      remaining = Math.max(0, remaining - it.text.length);
+    } else if (remaining <= 0) {
+      it.state = "over";
+    } else if (it.text.length > remaining) {
+      let cut = it.text.slice(0, remaining);
       const nl = cut.lastIndexOf("\n");
       if (nl > remaining * 0.5) cut = cut.slice(0, nl);
-      text = cut.trimEnd() + "\n[…trimmed to fit the lorebook budget]";
-      trimmed = true;
+      it.sent = cut.trimEnd() + "\n[…trimmed to fit the lorebook budget]";
+      it.state = "trimmed";
       remaining = 0;
     } else {
-      remaining -= text.length;
+      it.state = "in";
+      remaining -= it.text.length;
     }
-    out.push({ name: b.name, text });
   }
-  return { out, trimmed, skipped };
+  for (const it of items) if (it.excluded) it.state = "off";
+  return items;
 }
 
 // Builds everything that goes into the system message, as labelled sections.
@@ -138,6 +204,16 @@ async function buildContext(userId, settings) {
     { id: "system", label: "System prompt", text: settings.systemPrompt.trim() || DEFAULT_SYSTEM },
   ];
   const notes = [];
+  let loreItems = [];
+
+  const rule = LENGTH_RULES[settings.length];
+  if (rule) {
+    sections.push({
+      id: "length",
+      label: `Response length (${LENGTH_LABELS[settings.length]})`,
+      text: rule,
+    });
+  }
 
   if (useChat) {
     if (settings.includeCard && active.character_id) {
@@ -168,21 +244,32 @@ async function buildContext(userId, settings) {
         const last = msgs[msgs.length - 1];
         const sig = `${msgs.length}:${last && last.id ? last.id : ""}:${last ? String(last.content).length : 0}`;
         const lore = await getLore(active.id, userId, sig);
+        const prefs = await getLorePrefs(active.id, userId);
+        loreItems = planLore(lore.blocks, prefs, settings.loreBudget);
+
         const st = lore.stats;
         if (st) notes.push(`Lorebook: ${st.activatedAfterBudget} of ${st.totalCandidates} entries triggered.`);
-        if (!lore.blocks.length) {
+
+        if (!loreItems.length) {
           notes.push("No lorebook entries are triggered right now.");
         } else {
-          const b = budgetLore(lore.blocks, settings.loreBudget);
-          b.out.forEach((x, i) => {
+          const inc = loreItems.filter((x) => x.state === "in" || x.state === "trimmed");
+          const off = loreItems.filter((x) => x.state === "off").length;
+          const over = loreItems.filter((x) => x.state === "over").length;
+          inc.forEach((x, i) => {
             sections.push({
               id: `lore${i}`,
-              label: `Lorebook: ${x.name}`,
-              text: `<lorebook name="${x.name}">\n${x.text}\n</lorebook>`,
+              label: `Lorebook: ${x.key}`,
+              text: `<lorebook name="${x.name}">\n${x.sent}\n</lorebook>`,
             });
           });
-          if (b.trimmed) notes.push(`Lorebook trimmed to fit the ~${settings.loreBudget} token budget.`);
-          if (b.skipped) notes.push(`${b.skipped} lorebook block(s) skipped (over budget).`);
+          const extra = [];
+          if (off) extra.push(`${off} turned off`);
+          if (over) extra.push(`${over} over the ~${settings.loreBudget} token budget`);
+          notes.push(
+            `Included ${inc.length} of ${loreItems.length} triggered entries` +
+              (extra.length ? ` (${extra.join(", ")})` : "") + ".",
+          );
         }
       } catch (e) {
         spindle.log.warn("[Copilot] lorebook failed: " + e.message);
@@ -203,7 +290,23 @@ async function buildContext(userId, settings) {
     }
   }
 
-  return { sections, notes, useChat };
+  const lore = loreItems.map((x) => ({
+    key: x.key,
+    name: x.name,
+    tokens: x.tokens,
+    state: x.state,
+    pinned: x.pinned,
+    excluded: x.excluded,
+    text: x.text,
+  }));
+
+  return { sections, notes, useChat, lore };
+}
+
+async function sendPreview(userId) {
+  const settings = await getSettings(userId);
+  const { sections, notes, useChat, lore } = await buildContext(userId, settings);
+  spindle.sendToFrontend({ type: "context_preview", sections, notes, useChat, lore }, userId);
 }
 
 spindle.log.info("[Copilot] backend started");
@@ -239,11 +342,51 @@ spindle.onFrontendMessage(async (payload, userId) => {
 
     case "context_preview": {
       try {
-        const settings = await getSettings(userId);
-        const { sections, notes, useChat } = await buildContext(userId, settings);
-        spindle.sendToFrontend({ type: "context_preview", sections, notes, useChat }, userId);
+        await sendPreview(userId);
       } catch (e) {
         spindle.log.warn("[Copilot] context preview failed: " + e.message);
+      }
+      break;
+    }
+
+    case "lore_set": {
+      try {
+        const key = String(payload.key || "");
+        const active = await spindle.chats.getActive(userId);
+        if (!key || !active) break;
+        const prefs = await getLorePrefs(active.id, userId);
+        const toggle = (arr, on) => {
+          const s = new Set(arr);
+          if (on) s.add(key);
+          else s.delete(key);
+          return [...s].slice(0, 500);
+        };
+        const next = { excluded: prefs.excluded, pinned: prefs.pinned };
+        if (typeof payload.excluded === "boolean") next.excluded = toggle(prefs.excluded, payload.excluded);
+        if (typeof payload.pinned === "boolean") next.pinned = toggle(prefs.pinned, payload.pinned);
+        await saveLorePrefs(active.id, userId, next);
+        await sendPreview(userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] lore_set failed: " + e.message);
+      }
+      break;
+    }
+
+    case "lore_bulk": {
+      try {
+        const active = await spindle.chats.getActive(userId);
+        if (!active) break;
+        const prefs = await getLorePrefs(active.id, userId);
+        let excluded = [];
+        if (payload.action === "none") {
+          const settings = await getSettings(userId);
+          const { lore } = await buildContext(userId, settings);
+          excluded = [...new Set([...prefs.excluded, ...lore.map((x) => x.key)])].slice(0, 500);
+        }
+        await saveLorePrefs(active.id, userId, { excluded, pinned: prefs.pinned });
+        await sendPreview(userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] lore_bulk failed: " + e.message);
       }
       break;
     }

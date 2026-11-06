@@ -13,6 +13,7 @@ const ICONS = {
   cpu: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
   check: '<polyline points="20 6 9 17 4 12"/>',
   layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+  pin: '<line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/>',
 };
 
 const STYLES = `
@@ -104,6 +105,15 @@ const STYLES = `
   .cp-pre { margin:8px 0 0; padding:8px; max-height:240px; overflow:auto; cursor:text; white-space:pre-wrap;
     word-break:break-word; font-family:var(--lumiverse-font-mono, monospace); font-size:11px; line-height:1.45;
     background:var(--cp-fill-hover); border-radius:8px; }
+
+  .cp-lore { display:flex; flex-direction:column; gap:2px; padding:8px 10px; background:var(--cp-fill);
+    border:1px solid var(--cp-border); border-radius:var(--cp-radius); }
+  .cp-lore-head { display:flex; gap:6px; align-items:center; margin-bottom:4px; }
+  .cp-lrow { display:flex; gap:6px; align-items:center; cursor:pointer; padding:1px 0; }
+  .cp-lrow input { accent-color:var(--cp-primary); flex:none; margin:0; }
+  .cp-lrow.dim .cp-sec-name { opacity:0.5; }
+  .cp-act.pinned { color:var(--cp-primary); }
+  .cp-act.pinned svg { fill:currentColor; }
 
   .cp-inputbar { display:flex; align-items:flex-end; gap:8px; }
   .cp-input { flex:1; min-width:0; resize:none; min-height:38px; max-height:140px; padding:9px 14px; line-height:1.4;
@@ -270,6 +280,7 @@ export function setup(ctx) {
   let ctxSections = null;
   let ctxUseChat = false;
   let ctxNotes = [];
+  let ctxLore = [];
   let ctxOpen = false;
   const openIds = new Set();
   let settings = {
@@ -280,6 +291,7 @@ export function setup(ctx) {
     includePersona: true,
     includeLore: false,
     loreBudget: 1500,
+    length: "auto",
     systemPrompt: "",
   };
 
@@ -344,7 +356,15 @@ export function setup(ctx) {
   const connSelect = el("select", "cp-sel");
   connSelect.style.flex = "1";
   connSelect.title = "Connection used for Copilot";
-  connRow.append(connIco, connSelect);
+  const lenSelect = el("select", "cp-sel");
+  lenSelect.style.width = "84px";
+  lenSelect.title = "Reply length";
+  for (const [v, t] of [["auto", "Auto"], ["short", "Short"], ["medium", "Medium"], ["long", "Long"]]) {
+    const o = el("option", "", t);
+    o.value = v;
+    lenSelect.appendChild(o);
+  }
+  connRow.append(connIco, connSelect, lenSelect);
 
   // settings panel
   const setPanel = el("div", "cp-set");
@@ -425,6 +445,86 @@ export function setup(ctx) {
       : `${history.length} msgs`;
   }
 
+  function secEl(it, total) {
+    const t = est(it.text);
+    const sec = el("div", "cp-sec");
+    const top = el("div", "cp-sec-top");
+    top.append(el("span", "cp-sec-name", it.label), el("span", "cp-dim", "~" + fmt(t)));
+    const meter = el("div", "cp-meter");
+    const fill = el("div", "cp-meter-fill");
+    fill.style.width = (total ? Math.max(2, Math.round((t / total) * 100)) : 0) + "%";
+    meter.appendChild(fill);
+    sec.append(top, meter);
+    if (openIds.has(it.id)) {
+      const pre = el("pre", "cp-pre");
+      pre.textContent = it.text;
+      sec.appendChild(pre);
+    }
+    sec.addEventListener("click", (e) => {
+      if (e.target.closest(".cp-pre")) return;
+      if (openIds.has(it.id)) openIds.delete(it.id);
+      else openIds.add(it.id);
+      renderContextView();
+    });
+    return sec;
+  }
+
+  function loreGroupEl() {
+    const box = el("div", "cp-lore");
+    const head = el("div", "cp-lore-head");
+    const inCount = ctxLore.filter((x) => x.state === "in" || x.state === "trimmed").length;
+    head.appendChild(el("span", "cp-sec-name", `Lorebook · ${inCount} of ${ctxLore.length} included`));
+    for (const [label, action] of [["All", "all"], ["None", "none"]]) {
+      const b = el("button", "cp-btn", label);
+      b.style.cssText = "height:24px;padding:0 8px;font-size:11px;";
+      b.title = action === "all" ? "Include every triggered entry" : "Exclude every triggered entry";
+      b.addEventListener("click", () => ctx.sendToBackend({ type: "lore_bulk", action }));
+      head.appendChild(b);
+    }
+    box.appendChild(head);
+
+    for (const x of ctxLore) {
+      const id = "lk:" + x.key;
+      const item = el("div");
+      const row = el("div", "cp-lrow" + (x.state === "over" || x.state === "off" ? " dim" : ""));
+
+      const cb = el("input");
+      cb.type = "checkbox";
+      cb.checked = !x.excluded;
+      cb.addEventListener("click", (e) => e.stopPropagation());
+      cb.addEventListener("change", () =>
+        ctx.sendToBackend({ type: "lore_set", key: x.key, excluded: !cb.checked }));
+
+      const pin = el("button", "cp-act" + (x.pinned ? " pinned" : ""));
+      pin.innerHTML = svg(ICONS.pin, 14);
+      pin.title = x.pinned ? "Unpin" : "Pin: always fits in the budget";
+      pin.addEventListener("click", (e) => {
+        e.stopPropagation();
+        ctx.sendToBackend({ type: "lore_set", key: x.key, pinned: !x.pinned });
+      });
+
+      const tag =
+        x.state === "over" ? "over budget" :
+        x.state === "off" ? "off" :
+        x.state === "trimmed" ? "trimmed" : "~" + fmt(x.tokens);
+
+      row.append(cb, pin, el("span", "cp-sec-name", x.key), el("span", "cp-dim", tag));
+      row.addEventListener("click", () => {
+        if (openIds.has(id)) openIds.delete(id);
+        else openIds.add(id);
+        renderContextView();
+      });
+      item.appendChild(row);
+      if (openIds.has(id)) {
+        const pre = el("pre", "cp-pre");
+        pre.textContent = x.text;
+        item.appendChild(pre);
+      }
+      box.appendChild(item);
+    }
+    return box;
+  }
+
   function renderContextView() {
     ctxView.replaceChildren();
     if (!ctxSections) {
@@ -432,18 +532,16 @@ export function setup(ctx) {
       return;
     }
 
-    for (const n of ctxNotes) {
-      const d = el("div", "cp-dim", n);
-      d.style.whiteSpace = "normal";
-      ctxView.appendChild(d);
-    }
-
-    const items = ctxSections.map((s) => ({ id: s.id, label: s.label, text: s.text }));
+    const isLore = (s) => /^lore\d+$/.test(s.id);
+    const items = ctxSections
+      .filter((s) => !isLore(s))
+      .map((s) => ({ id: s.id, label: s.label, text: s.text }));
     const convo = history.slice(-40);
     if (convo.length) {
       items.push({ id: "convo", label: `Copilot conversation (${convo.length})`, text: convoText() });
     }
-    const total = items.reduce((a, it) => a + est(it.text), 0);
+    const loreTokens = ctxSections.filter(isLore).reduce((a, s) => a + est(s.text), 0);
+    const total = items.reduce((a, it) => a + est(it.text), 0) + loreTokens;
 
     ctxView.appendChild(
       el("div", "cp-dim", `Sent with your next message · ~${fmt(total)} tokens (rough estimate)`),
@@ -451,30 +549,21 @@ export function setup(ctx) {
     if (!ctxUseChat) {
       ctxView.appendChild(el("div", "cp-dim", "General mode: no chat context is included."));
     }
-
-    for (const it of items) {
-      const t = est(it.text);
-      const sec = el("div", "cp-sec");
-      const top = el("div", "cp-sec-top");
-      top.append(el("span", "cp-sec-name", it.label), el("span", "cp-dim", "~" + fmt(t)));
-      const meter = el("div", "cp-meter");
-      const fill = el("div", "cp-meter-fill");
-      fill.style.width = (total ? Math.max(2, Math.round((t / total) * 100)) : 0) + "%";
-      meter.appendChild(fill);
-      sec.append(top, meter);
-      if (openIds.has(it.id)) {
-        const pre = el("pre", "cp-pre");
-        pre.textContent = it.text;
-        sec.appendChild(pre);
-      }
-      sec.addEventListener("click", (e) => {
-        if (e.target.closest(".cp-pre")) return;
-        if (openIds.has(it.id)) openIds.delete(it.id);
-        else openIds.add(it.id);
-        renderContextView();
-      });
-      ctxView.appendChild(sec);
+    for (const n of ctxNotes) {
+      const d = el("div", "cp-dim", n);
+      d.style.whiteSpace = "normal";
+      ctxView.appendChild(d);
     }
+
+    let loreDone = !ctxLore.length;
+    for (const it of items) {
+      if (!loreDone && (it.id === "chat" || it.id === "convo")) {
+        ctxView.appendChild(loreGroupEl());
+        loreDone = true;
+      }
+      ctxView.appendChild(secEl(it, total));
+    }
+    if (!loreDone) ctxView.appendChild(loreGroupEl());
   }
 
   function setCtxOpen(v) {
@@ -505,6 +594,7 @@ export function setup(ctx) {
     loreCb.checked = !!settings.includeLore;
     budgetNum.value = String(settings.loreBudget);
     promptTa.value = settings.systemPrompt || defaultSystem;
+    lenSelect.value = settings.length || "auto";
   }
 
   function commitCtx(n) {
@@ -525,6 +615,11 @@ export function setup(ctx) {
   });
   connSelect.addEventListener("change", () => {
     settings.connectionId = connSelect.value;
+    saveSettings();
+  });
+
+  lenSelect.addEventListener("change", () => {
+    settings.length = lenSelect.value;
     saveSettings();
   });
   ctxRange.addEventListener("input", () => { ctxNum.value = ctxRange.value; });
@@ -786,6 +881,7 @@ export function setup(ctx) {
         ctxSections = Array.isArray(p.sections) ? p.sections : [];
         ctxUseChat = !!p.useChat;
         ctxNotes = Array.isArray(p.notes) ? p.notes : [];
+        ctxLore = Array.isArray(p.lore) ? p.lore : [];
         updateReadout();
         if (ctxOpen) renderContextView();
         break;
