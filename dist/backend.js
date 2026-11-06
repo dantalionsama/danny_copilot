@@ -11,6 +11,21 @@ const LENGTH_RULES = {
 };
 const LENGTH_LABELS = { short: "Short", medium: "Medium", long: "Long" };
 
+const PROPOSAL_RULES = `LOREBOOK PROPOSALS
+You can propose lorebook entries, but ONLY when the writer explicitly asks you to create or update one. Never propose unprompted.
+When asked, write your normal short reply, then add one block per entry at the very end, in exactly this format:
+
+<lorebook_entry action="create">
+name: Short entry title
+keys: keyword one, keyword two, keyword three
+content:
+The entry text, written as concise reference info for the roleplay AI.
+</lorebook_entry>
+
+To change an existing entry, use action="update" and add a line "update: <exact existing entry name>" under the name line. For updates, content must be the COMPLETE new text of the entry (it replaces the old text), so keep everything that should stay.
+If you can't see an entry's current text, ask the writer to paste it instead of guessing.
+The writer reviews and approves every block in the app, so don't explain the format or mention approval.`;
+
 const DEFAULTS = {
   mode: "chat",
   ctxCount: 10,
@@ -20,6 +35,7 @@ const DEFAULTS = {
   includeLore: false,
   loreBudget: 1500,
   length: "auto",
+  proposals: true,
   systemPrompt: "",
 };
 
@@ -29,10 +45,15 @@ const loreCache = new Map();
 const lorePrefsCache = new Map();
 const pickCache = new Map();
 const sessCache = new Map();
+const attachedCache = new Map();
+const namesCache = new Map();
 const limitCache = {};
 const uk = (userId) => userId || "_";
 const clip = (s, n) => String(s || "").slice(0, n);
 const san = (s) => String(s).replace(/[^a-zA-Z0-9_-]/g, "");
+const norm = (s) => String(s || "").trim().toLowerCase();
+const strArr = (a, maxN = 30, maxLen = 100) =>
+  (Array.isArray(a) ? a : []).filter((x) => typeof x === "string").slice(0, maxN).map((x) => x.slice(0, maxLen));
 
 // Session "s1" keeps using the original history file, so old histories carry over untouched.
 const histPath = (key) => `copilot_history_${san(key)}.json`;
@@ -41,10 +62,41 @@ const sessPath = (key, sid) => (sid === "s1" ? histPath(key) : `copilot_hist_${s
 const lorePath = (chatId) => `copilot_lore_${san(chatId)}.json`;
 const pickPath = (chatId) => `copilot_pick_${san(chatId)}.json`;
 
+// ---------- history (messages may carry lorebook proposal states) ----------
+const PROP_STATUS = ["pending", "approved", "rejected", "undone"];
+
+function cleanProps(raw) {
+  if (!Array.isArray(raw)) return undefined;
+  const out = raw.slice(0, 10).map((p) => {
+    if (!p || typeof p !== "object") return { status: "pending" };
+    const o = { status: PROP_STATUS.includes(p.status) ? p.status : "pending" };
+    for (const f of ["action", "bookId", "bookName", "entryId"]) {
+      if (typeof p[f] === "string") o[f] = p[f].slice(0, 300);
+    }
+    if (p.prev && typeof p.prev === "object") {
+      o.prev = {
+        key: strArr(p.prev.key, 200, 300),
+        content: clip(p.prev.content, 100000),
+        comment: clip(p.prev.comment, 300),
+      };
+    }
+    if (p.edit && typeof p.edit === "object") {
+      o.edit = { name: clip(p.edit.name, 300), keys: strArr(p.edit.keys), content: clip(p.edit.content, 20000) };
+    }
+    return o;
+  });
+  return out.some((o) => o.status !== "pending" || o.edit) ? out : undefined;
+}
+
 function cleanHistory(raw) {
   return (Array.isArray(raw) ? raw : [])
     .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-    .map((m) => ({ role: m.role, content: m.content }));
+    .map((m) => {
+      const o = { role: m.role, content: m.content };
+      const p = cleanProps(m.props);
+      if (p) o.props = p;
+      return o;
+    });
 }
 
 function cleanSettings(s) {
@@ -60,6 +112,7 @@ function cleanSettings(s) {
     const lb = Number(s.loreBudget);
     if (Number.isFinite(lb)) o.loreBudget = Math.max(200, Math.min(8000, Math.floor(lb)));
     if (["auto", "short", "medium", "long"].includes(s.length)) o.length = s.length;
+    o.proposals = s.proposals !== false;
     if (typeof s.systemPrompt === "string") o.systemPrompt = s.systemPrompt.slice(0, 8000);
   }
   return o;
@@ -210,6 +263,87 @@ async function savePick(chatId, userId, pick) {
   }
 }
 
+// ---------- lorebook books and entries (for proposals) ----------
+function needWB() {
+  if (!spindle.world_books) {
+    throw new Error("Danny Copilot doesn't have the lorebook permission yet. Approve it in the extension's permissions.");
+  }
+}
+
+async function listAllBooks(userId) {
+  needWB();
+  const out = [];
+  for (let offset = 0; offset < 1000; offset += 200) {
+    const r = await spindle.world_books.list({ limit: 200, offset, userId });
+    const data = (r && r.data) || [];
+    for (const b of data) out.push({ id: b.id, name: b.name });
+    if (data.length < 200) break;
+  }
+  return out;
+}
+
+async function listEntries(bookId, userId) {
+  needWB();
+  const out = [];
+  for (let offset = 0; offset < 1000; offset += 200) {
+    const r = await spindle.world_books.entries.list(bookId, { limit: 200, offset, userId });
+    const data = (r && r.data) || [];
+    for (const e of data) out.push(e);
+    if (data.length < 200) break;
+  }
+  return out;
+}
+
+// The lorebooks attached to the active chat's character card.
+async function getAttached(userId) {
+  const active = await spindle.chats.getActive(userId);
+  if (!active || !active.character_id) return { characterName: "", books: [] };
+  const ck = `${uk(userId)}|${active.id}`;
+  const hit = attachedCache.get(ck);
+  if (hit && Date.now() - hit.at < 30000) return hit.val;
+
+  const c = await spindle.characters.get(active.character_id, userId);
+  const books = [];
+  if (spindle.world_books) {
+    const ids = c && Array.isArray(c.world_book_ids) ? c.world_book_ids : [];
+    for (const id of ids.slice(0, 10)) {
+      try {
+        const b = await spindle.world_books.get(id, userId);
+        if (b) books.push({ id: b.id, name: b.name });
+      } catch (e) {
+        spindle.log.warn("[Copilot] attached book load failed: " + e.message);
+      }
+    }
+  }
+  const val = { characterName: (c && c.name) || "", books };
+  attachedCache.set(ck, { at: Date.now(), val });
+  return val;
+}
+
+async function getEntryNames(userId, books) {
+  const key = `${uk(userId)}|${books.map((b) => b.id).join(",")}`;
+  const hit = namesCache.get(key);
+  if (hit && Date.now() - hit.at < 60000) return hit.names;
+  const names = [];
+  for (const b of books.slice(0, 3)) {
+    try {
+      for (const e of await listEntries(b.id, userId)) if (e.comment) names.push(String(e.comment));
+    } catch (e) {
+      spindle.log.warn("[Copilot] entry names failed: " + e.message);
+    }
+  }
+  namesCache.set(key, { at: Date.now(), names });
+  return names;
+}
+
+function proposalText(attached, names) {
+  let t = PROPOSAL_RULES;
+  if (attached.books.length && names.length) {
+    t += `\n\nExisting entries in ${attached.books.map((b) => b.name).join(", ")}: ${clip(names.slice(0, 120).join("; "), 3000)}`;
+  }
+  return t;
+}
+
 function cardBlock(c) {
   const parts = [
     ["Description", c.description],
@@ -316,6 +450,24 @@ async function buildContext(userId, settings, opts = {}) {
       id: "length",
       label: `Response length (${LENGTH_LABELS[settings.length]})`,
       text: rule,
+    });
+  }
+
+  if (settings.proposals) {
+    let attached = { characterName: "", books: [] };
+    let names = [];
+    if (useChat) {
+      try {
+        attached = await getAttached(userId);
+        names = await getEntryNames(userId, attached.books);
+      } catch (e) {
+        spindle.log.warn("[Copilot] proposal context failed: " + e.message);
+      }
+    }
+    sections.push({
+      id: "proposals",
+      label: "Lorebook proposals (instructions)",
+      text: proposalText(attached, names),
     });
   }
 
@@ -638,6 +790,127 @@ spindle.onFrontendMessage(async (payload, userId) => {
       break;
     }
 
+    // ----- lorebook proposals -----
+    case "lore_targets": {
+      const rid = payload.rid;
+      try {
+        needWB();
+        const att = await getAttached(userId);
+        const all = att.books.length ? [] : await listAllBooks(userId);
+        spindle.sendToFrontend({
+          type: "lore_targets", rid, ok: true,
+          characterName: att.characterName, attached: att.books, all,
+        }, userId);
+      } catch (e) {
+        spindle.sendToFrontend({ type: "lore_targets", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
+    case "lore_lookup": {
+      const rid = payload.rid;
+      try {
+        needWB();
+        const att = await getAttached(userId);
+        const books = att.books.length ? att.books : (await listAllBooks(userId)).slice(0, 20);
+        const want = norm(payload.name);
+        let hit = null;
+        let hitBook = null;
+        for (const b of books) {
+          const found = (await listEntries(b.id, userId)).find((e) => norm(e.comment) === want);
+          if (found) { hit = found; hitBook = b; break; }
+        }
+        if (!hit) {
+          spindle.sendToFrontend({ type: "lore_lookup", rid, ok: true, found: false }, userId);
+        } else {
+          spindle.sendToFrontend({
+            type: "lore_lookup", rid, ok: true, found: true,
+            bookId: hitBook.id, bookName: hitBook.name, entryId: hit.id,
+            name: String(hit.comment || ""), keys: strArr(hit.key, 200, 300), content: String(hit.content || ""),
+          }, userId);
+        }
+      } catch (e) {
+        spindle.sendToFrontend({ type: "lore_lookup", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
+    case "lore_apply": {
+      const rid = payload.rid;
+      try {
+        needWB();
+        const name = clip(payload.name, 300).trim();
+        const content = clip(payload.content, 20000).trim();
+        const keys = strArr(payload.keys);
+        if (!content) throw new Error("The entry has no content.");
+
+        let reply;
+        if (payload.action === "update" && payload.entryId) {
+          const cur = await spindle.world_books.entries.get(String(payload.entryId), userId);
+          if (!cur) throw new Error("That entry no longer exists.");
+          const prev = {
+            key: strArr(cur.key, 200, 300),
+            content: String(cur.content || ""),
+            comment: String(cur.comment || ""),
+          };
+          const patch = { content };
+          if (keys.length) patch.key = keys;
+          if (name && name !== cur.comment) patch.comment = name;
+          await spindle.world_books.entries.update(cur.id, patch, userId);
+          const book = await spindle.world_books.get(cur.world_book_id, userId).catch(() => null);
+          reply = {
+            action: "update", bookId: cur.world_book_id, bookName: book ? book.name : "",
+            entryId: cur.id, prev,
+          };
+        } else {
+          const bookId = String(payload.bookId || "");
+          if (!bookId) throw new Error("No lorebook selected.");
+          const book = await spindle.world_books.get(bookId, userId);
+          if (!book) throw new Error("That lorebook no longer exists.");
+          const e = await spindle.world_books.entries.create(
+            bookId,
+            { key: keys, content, comment: name || "Untitled entry", disabled: false },
+            userId,
+          );
+          reply = { action: "create", bookId, bookName: book.name, entryId: e.id };
+        }
+        loreCache.clear();
+        namesCache.clear();
+        spindle.sendToFrontend({ type: "lore_applied", rid, ok: true, ...reply }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] lore_apply failed: " + e.message);
+        spindle.sendToFrontend({ type: "lore_applied", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
+    case "lore_undo": {
+      const rid = payload.rid;
+      try {
+        needWB();
+        const entryId = String(payload.entryId || "");
+        if (!entryId) throw new Error("Nothing to undo.");
+        if (payload.action === "create") {
+          await spindle.world_books.entries.delete(entryId, userId);
+        } else {
+          const prev = payload.prev;
+          if (!prev || typeof prev !== "object") throw new Error("The old version wasn't saved.");
+          await spindle.world_books.entries.update(entryId, {
+            content: String(prev.content || ""),
+            key: strArr(prev.key, 200, 300),
+            comment: String(prev.comment || ""),
+          }, userId);
+        }
+        loreCache.clear();
+        namesCache.clear();
+        spindle.sendToFrontend({ type: "lore_undone", rid, ok: true }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] lore_undo failed: " + e.message);
+        spindle.sendToFrontend({ type: "lore_undone", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
     case "save_settings": {
       const s = cleanSettings(payload.settings);
       cache[uk(userId)] = s;
@@ -677,9 +950,13 @@ spindle.onFrontendMessage(async (payload, userId) => {
         const settings = await getSettings(userId);
         const { sections } = await buildContext(userId, settings);
 
+        const past = cleanHistory(payload.history)
+          .slice(-40)
+          .map(({ role, content }) => ({ role, content }));
+
         const messages = [
           { role: "system", content: sections.map((s) => s.text).join("\n\n") },
-          ...cleanHistory(payload.history).slice(-40),
+          ...past,
           { role: "user", content: String(payload.text || "") },
         ];
 

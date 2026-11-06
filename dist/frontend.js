@@ -136,6 +136,23 @@ const STYLES = `
   .cp-ptext { flex:1; min-width:0; font-size:12px; line-height:1.35; word-break:break-word; overflow:hidden;
     display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
 
+  .cp-card { margin-top:6px; padding:10px; display:flex; flex-direction:column; gap:6px;
+    background:var(--cp-fill); border:1px solid var(--cp-border);
+    border-left:3px solid var(--cp-primary); border-radius:var(--cp-radius); }
+  .cp-card.approved { border-left-color:var(--lumiverse-success, var(--cp-primary)); }
+  .cp-card.rejected, .cp-card.undone { opacity:0.55; border-left-color:var(--cp-border); }
+  .cp-card-head { font-size:11px; text-transform:uppercase; letter-spacing:0.04em; color:var(--cp-muted); }
+  .cp-card-title { font-weight:600; word-break:break-word; }
+  .cp-card-keys { font-size:11px; color:var(--cp-muted); word-break:break-word; }
+  .cp-card-body { white-space:pre-wrap; font-size:12px; line-height:1.45; max-height:8.5em; overflow:hidden;
+    cursor:pointer; word-break:break-word; }
+  .cp-card-body.open { max-height:none; }
+  .cp-card-actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .cp-card-err { font-size:11px; color:var(--lumiverse-danger, #e5484d); }
+  .cp-confirm { display:flex; flex-direction:column; gap:8px; padding:8px 10px; font-size:12px; line-height:1.4;
+    background:var(--cp-tint); border:1px solid color-mix(in srgb, var(--cp-primary) 40%, transparent);
+    border-radius:var(--cp-radius); }
+
   .cp-inputbar { display:flex; align-items:flex-end; gap:8px; }
   .cp-input { flex:1; min-width:0; resize:none; min-height:38px; max-height:140px; padding:9px 14px; line-height:1.4;
     background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:19px; }
@@ -282,6 +299,47 @@ async function copyText(text) {
 const est = (s) => Math.ceil(String(s).length / 4);
 const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
 
+// ---------- lorebook proposals (blocks Danny writes at the end of a reply) ----------
+const PROP_RE = /<lorebook_entry\b([^>]*)>([\s\S]*?)<\/lorebook_entry>/gi;
+
+function parseProposals(text) {
+  const blocks = [];
+  const src = String(text).replace(/```[a-z]*\s*(<lorebook_entry\b[\s\S]*?<\/lorebook_entry>)\s*```/gi, "$1");
+  const clean = src.replace(PROP_RE, (whole, attrs, body) => {
+    const b = {
+      action: /action\s*=\s*["']?update/i.test(attrs) ? "update" : "create",
+      name: "",
+      keys: [],
+      update: "",
+      content: "",
+    };
+    const lines = body.replace(/\r/g, "").split("\n");
+    const contentLines = [];
+    let inContent = false;
+    for (const line of lines) {
+      if (inContent) { contentLines.push(line); continue; }
+      const mm = line.match(/^\s*(name|keys?|update|content)\s*:\s?(.*)$/i);
+      if (!mm) continue;
+      const f = mm[1].toLowerCase();
+      const v = mm[2];
+      if (f === "name") b.name = v.trim();
+      else if (f === "update") b.update = v.trim();
+      else if (f.startsWith("key")) b.keys = v.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 30);
+      else {
+        inContent = true;
+        if (v.trim()) contentLines.push(v);
+      }
+    }
+    b.content = contentLines.join("\n").trim();
+    if (!b.content) return whole;
+    if (b.action === "update" && !b.update) b.update = b.name;
+    if (!b.name) b.name = b.update || "Untitled entry";
+    blocks.push(b);
+    return "";
+  });
+  return { text: clean.replace(/\n{3,}/g, "\n\n").trim(), blocks };
+}
+
 // ---------- extension ----------
 export function setup(ctx) {
   console.log("[danny_copilot] frontend setup running");
@@ -310,6 +368,8 @@ export function setup(ctx) {
   let rangeArmed = false;
   let rangeStart = null;
   let pickScrollTop = null;
+  let ridN = 0;
+  const pendingCbs = new Map();
   let sessions = { active: null, list: [] };
   const openIds = new Set();
   let settings = {
@@ -321,6 +381,7 @@ export function setup(ctx) {
     includeLore: false,
     loreBudget: 1500,
     length: "auto",
+    proposals: true,
     systemPrompt: "",
   };
 
@@ -409,6 +470,10 @@ export function setup(ctx) {
   const personaCb = el("input");
   personaCb.type = "checkbox";
   personaRow.append(personaCb, el("span", "", "Include persona"));
+  const propRow = el("label", "cp-check");
+  const propCb = el("input");
+  propCb.type = "checkbox";
+  propRow.append(propCb, el("span", "", "Allow lorebook proposals"));
   const loreRow = el("label", "cp-check");
   const loreCb = el("input");
   loreCb.type = "checkbox";
@@ -435,7 +500,7 @@ export function setup(ctx) {
   const promptTa = el("textarea");
   const resetBtn = el("button", "cp-btn", "Reset prompt");
   resetBtn.style.alignSelf = "flex-start";
-  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, promptLabel, promptTa, resetBtn);
+  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, propRow, promptLabel, promptTa, resetBtn);
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
@@ -784,6 +849,7 @@ export function setup(ctx) {
     budgetNum.value = String(settings.loreBudget);
     lenSelect.value = settings.length || "auto";
     promptTa.value = settings.systemPrompt || defaultSystem;
+    propCb.checked = settings.proposals !== false;
   }
 
   function commitCtx(n) {
@@ -815,6 +881,7 @@ export function setup(ctx) {
   ctxNum.addEventListener("change", () => commitCtx(ctxNum.value));
   cardCb.addEventListener("change", () => { settings.includeCard = cardCb.checked; saveSettings(); });
   personaCb.addEventListener("change", () => { settings.includePersona = personaCb.checked; saveSettings(); });
+  propCb.addEventListener("change", () => { settings.proposals = propCb.checked; saveSettings(); });
   loreCb.addEventListener("change", () => { settings.includeLore = loreCb.checked; saveSettings(); });
   budgetNum.addEventListener("change", () => {
     settings.loreBudget = Math.max(200, Math.min(8000, Math.floor(Number(budgetNum.value) || 1500)));
@@ -858,15 +925,229 @@ export function setup(ctx) {
     return b;
   }
 
+  function rpc(msg) {
+    return new Promise((resolve) => {
+      const rid = ++ridN;
+      pendingCbs.set(rid, resolve);
+      ctx.sendToBackend({ ...msg, rid });
+      setTimeout(() => {
+        if (pendingCbs.delete(rid)) resolve({ ok: false, error: "Timed out waiting for Lumiverse." });
+      }, 20000);
+    });
+  }
+
+  function setProp(i, k, patch) {
+    const m = history[i];
+    if (!m) return;
+    if (!Array.isArray(m.props)) m.props = [];
+    while (m.props.length <= k) m.props.push({ status: "pending" });
+    m.props[k] = { ...m.props[k], ...patch };
+    saveHistory();
+    renderHistory();
+  }
+
+  function cardData(block, st) {
+    if (!st.edit) return block;
+    return {
+      ...block,
+      name: st.edit.name || block.name,
+      keys: st.edit.keys || [],
+      content: st.edit.content || block.content,
+    };
+  }
+
+  function startCardEdit(card, i, k, data) {
+    card.replaceChildren();
+    const nameIn = el("input", "cp-field");
+    nameIn.value = data.name;
+    nameIn.placeholder = "Entry name";
+    const keysIn = el("input", "cp-field");
+    keysIn.value = data.keys.join(", ");
+    keysIn.placeholder = "Keywords, comma separated";
+    nameIn.style.flex = "none";
+    keysIn.style.flex = "none";
+    const ta = el("textarea", "cp-edit");
+    ta.value = data.content;
+    ta.style.minHeight = "140px";
+    const row = el("div", "cp-card-actions");
+    row.append(
+      textBtn("Save", true, () => {
+        const content = ta.value.trim();
+        if (!content) return;
+        setProp(i, k, {
+          edit: {
+            name: nameIn.value.trim() || data.name,
+            keys: keysIn.value.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 30),
+            content,
+          },
+        });
+      }),
+      textBtn("Cancel", false, () => renderHistory()),
+    );
+    card.append(nameIn, keysIn, ta, row);
+  }
+
+  async function openConfirm(card, area, i, k, data, block) {
+    area.style.display = "none";
+    const box = el("div", "cp-confirm");
+    box.appendChild(el("div", "", "Checking your lorebooks…"));
+    card.appendChild(box);
+    const close = () => { box.remove(); area.style.display = ""; };
+
+    const t = await rpc({ type: "lore_targets" });
+    let found = null;
+    if (t && t.ok && data.action === "update") {
+      const r = await rpc({ type: "lore_lookup", name: block.update });
+      if (r && r.ok && r.found) found = r;
+    }
+
+    box.replaceChildren();
+    const line = (txt) => box.appendChild(el("div", "", txt));
+    const row = el("div", "cp-card-actions");
+    const cancelBtn = textBtn("Cancel", false, close);
+
+    if (!t || !t.ok) {
+      line("Couldn't reach your lorebooks: " + ((t && t.error) || "unknown error"));
+      row.appendChild(cancelBtn);
+      box.appendChild(row);
+      return;
+    }
+
+    let payload;
+    if (found) {
+      line(`This will update “${found.name}” in the lorebook “${found.bookName}”. The old text is kept so you can undo.`);
+      payload = () => ({ action: "update", entryId: found.entryId, bookId: found.bookId });
+    } else {
+      if (data.action === "update") {
+        line(`I couldn't find an entry called “${block.update}”, so this would be added as a new entry.`);
+      }
+      const who = t.characterName || "this card";
+      if (t.attached.length === 1) {
+        line(`This will be added to the lorebook attached to ${who}: “${t.attached[0].name}”.`);
+        payload = () => ({ action: "create", bookId: t.attached[0].id });
+      } else {
+        const list = t.attached.length ? t.attached : t.all;
+        line(
+          t.attached.length
+            ? `${who} has ${t.attached.length} lorebooks attached. Add it to:`
+            : `${t.characterName ? who + " has no lorebook attached." : "No lorebook is attached to this card."} Pick one of your lorebooks:`,
+        );
+        if (!list.length) {
+          line("You don't have any lorebooks yet.");
+          row.appendChild(cancelBtn);
+          box.appendChild(row);
+          return;
+        }
+        const pickSel = el("select", "cp-sel");
+        pickSel.style.width = "100%";
+        for (const b of list) {
+          const o = el("option", "", b.name);
+          o.value = b.id;
+          pickSel.appendChild(o);
+        }
+        box.appendChild(pickSel);
+        payload = () => ({ action: "create", bookId: pickSel.value });
+      }
+    }
+
+    const msg = el("div", "cp-card-err");
+    msg.style.display = "none";
+    const go = textBtn(found ? "Update entry" : "Add entry", true, async () => {
+      go.disabled = true;
+      cancelBtn.disabled = true;
+      const r = await rpc({
+        type: "lore_apply",
+        ...payload(),
+        name: data.name,
+        keys: data.keys,
+        content: data.content,
+      });
+      if (r && r.ok) {
+        setProp(i, k, {
+          status: "approved",
+          action: r.action,
+          bookId: r.bookId,
+          bookName: r.bookName,
+          entryId: r.entryId,
+          prev: r.prev,
+        });
+      } else {
+        go.disabled = false;
+        cancelBtn.disabled = false;
+        msg.textContent = "Couldn't save: " + ((r && r.error) || "unknown error");
+        msg.style.display = "";
+      }
+    });
+    row.append(go, cancelBtn);
+    box.append(msg, row);
+  }
+
+  function buildCard(i, k, block) {
+    const m = history[i];
+    const st = (Array.isArray(m.props) && m.props[k]) || { status: "pending" };
+    const data = cardData(block, st);
+    const card = el("div", "cp-card " + st.status);
+
+    const label = block.action === "update" ? "Update lorebook entry" : "New lorebook entry";
+    const tag = { approved: "added", rejected: "rejected", undone: "undone" }[st.status];
+    card.appendChild(el("div", "cp-card-head", tag ? `${label} · ${tag}` : label));
+    card.appendChild(el("div", "cp-card-title", data.name));
+    if (block.action === "update") {
+      card.appendChild(el("div", "cp-card-keys", "Replaces the text of: " + block.update));
+    }
+    if (data.keys.length) card.appendChild(el("div", "cp-card-keys", "Keys: " + data.keys.join(", ")));
+
+    const body = el("div", "cp-card-body", data.content);
+    body.title = "Click to expand";
+    body.addEventListener("click", () => body.classList.toggle("open"));
+    card.appendChild(body);
+
+    const area = el("div", "cp-card-actions");
+    const err = el("div", "cp-card-err");
+    err.style.display = "none";
+
+    if (st.status === "pending") {
+      area.append(
+        textBtn("Approve", true, () => openConfirm(card, area, i, k, data, block)),
+        textBtn("Edit", false, () => startCardEdit(card, i, k, data)),
+        textBtn("Reject", false, () => setProp(i, k, { status: "rejected" })),
+      );
+    } else if (st.status === "approved") {
+      area.appendChild(el("span", "cp-dim", st.bookName ? `In “${st.bookName}”` : "In your lorebook"));
+      const undo = textBtn("Undo", false, async () => {
+        undo.disabled = true;
+        const r = await rpc({ type: "lore_undo", action: st.action, entryId: st.entryId, prev: st.prev });
+        if (r && r.ok) {
+          setProp(i, k, { status: "undone" });
+        } else {
+          undo.disabled = false;
+          err.textContent = "Couldn't undo: " + ((r && r.error) || "unknown error");
+          err.style.display = "";
+        }
+      });
+      area.appendChild(undo);
+    } else {
+      area.appendChild(textBtn("Restore", false, () => setProp(i, k, { status: "pending" })));
+    }
+    card.append(area, err);
+    return card;
+  }
+
   function buildMessage(i, m) {
     const wrap = el("div", "cp-wrap " + m.role);
-    const bubble = el("div", "cp-msg " + m.role);
-    if (m.role === "assistant") {
-      bubble.classList.add("cp-md");
-      bubble.innerHTML = renderMarkdown(m.content);
-    } else {
-      bubble.textContent = m.content;
+    const parsed = m.role === "assistant" ? parseProposals(m.content) : null;
+
+    if (!parsed || parsed.text || !parsed.blocks.length) {
+      const bubble = el("div", "cp-msg " + m.role);
+      if (parsed) {
+        bubble.classList.add("cp-md");
+        bubble.innerHTML = renderMarkdown(parsed.text);
+      } else {
+        bubble.textContent = m.content;
+      }
+      wrap.appendChild(bubble);
     }
+    if (parsed) parsed.blocks.forEach((b, k) => wrap.appendChild(buildCard(i, k, b)));
 
     const bar = el("div", "cp-bar");
     const copyBtn = actBtn(ICONS.copy, "Copy text", async () => {
@@ -888,7 +1169,7 @@ export function setup(ctx) {
       }
     }
 
-    wrap.append(bubble, bar);
+    wrap.appendChild(bar);
     return wrap;
   }
 
@@ -933,7 +1214,12 @@ export function setup(ctx) {
   function paintStream() {
     raf = 0;
     if (!currentBubble) return;
-    currentBubble.innerHTML = renderMarkdown(assistantText);
+    const p = parseProposals(assistantText);
+    let t = p.text;
+    const open = t.search(/<lorebook_entry\b/i);
+    if (open >= 0) t = t.slice(0, open).trimEnd();
+    currentBubble.innerHTML =
+      renderMarkdown(t) + (open >= 0 ? '<p class="cp-dim">drafting a lorebook entry…</p>' : "");
     log.scrollTop = log.scrollHeight;
   }
 
@@ -1054,6 +1340,7 @@ export function setup(ctx) {
         requestPreview();
         break;
       }
+
       case "context_preview":
         ctxSections = Array.isArray(p.sections) ? p.sections : [];
         ctxUseChat = !!p.useChat;
@@ -1063,6 +1350,17 @@ export function setup(ctx) {
         updateReadout();
         if (ctxOpen) renderContextView();
         break;
+      case "lore_targets":
+      case "lore_lookup":
+      case "lore_applied":
+      case "lore_undone": {
+        const cb = pendingCbs.get(p.rid);
+        if (cb) {
+          pendingCbs.delete(p.rid);
+          cb(p);
+        }
+        break;
+      }
       case "token":
         if (p.reqId !== reqId || !currentBubble) return;
         assistantText += p.token;
