@@ -167,6 +167,13 @@ const STYLES = `
   .cp-thumb { width:18px; height:18px; object-fit:cover; border-radius:4px; flex:none; }
   .cp-chip .cp-act { width:18px; height:18px; }
 
+  .cp-diff { white-space:pre-wrap; font-size:12px; line-height:1.5; word-break:break-word;
+    max-height:14em; overflow:auto; cursor:pointer; }
+  .cp-diff.open { max-height:none; }
+  .cp-add { background:color-mix(in srgb, var(--lumiverse-success, #3fb27f) 28%, transparent); border-radius:3px; }
+  .cp-del { background:color-mix(in srgb, var(--lumiverse-danger, #e5484d) 28%, transparent);
+    text-decoration:line-through; opacity:0.85; border-radius:3px; }
+
   .cp-inputbar { display:flex; align-items:flex-end; gap:8px; }
   .cp-input { flex:1; min-width:0; resize:none; min-height:38px; max-height:140px; padding:9px 14px; line-height:1.4;
     background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:19px; }
@@ -314,30 +321,36 @@ const est = (s) => Math.ceil(String(s).length / 4);
 const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
 
 // ---------- lorebook proposals (blocks Danny writes at the end of a reply) ----------
-const PROP_RE = /<lorebook_entry\b([^>]*)>([\s\S]*?)<\/lorebook_entry>/gi;
+const PROP_RE = /<(lorebook_entry|chat_edit)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
 
 function parseProposals(text) {
   const blocks = [];
-  const src = String(text).replace(/```[a-z]*\s*(<lorebook_entry\b[\s\S]*?<\/lorebook_entry>)\s*```/gi, "$1");
-  const clean = src.replace(PROP_RE, (whole, attrs, body) => {
-    const b = {
-      action: /action\s*=\s*["']?update/i.test(attrs) ? "update" : "create",
-      name: "",
-      keys: [],
-      update: "",
-      content: "",
-    };
+  const src = String(text).replace(
+    /```[a-z]*\s*(<(?:lorebook_entry|chat_edit)\b[\s\S]*?<\/(?:lorebook_entry|chat_edit)>)\s*```/gi,
+    "$1",
+  );
+  const clean = src.replace(PROP_RE, (whole, tagName, attrs, body) => {
+    const kind = tagName.toLowerCase() === "chat_edit" ? "chat" : "lore";
+    const b = { kind, action: "create", name: "", keys: [], update: "", note: "", message: -1, content: "" };
+    if (kind === "lore") {
+      b.action = /action\s*=\s*["']?update/i.test(attrs) ? "update" : "create";
+    } else {
+      const mm = attrs.match(/message\s*=\s*["']?#?(\d+)/i);
+      if (!mm) return whole;
+      b.message = parseInt(mm[1], 10);
+    }
     const lines = body.replace(/\r/g, "").split("\n");
     const contentLines = [];
     let inContent = false;
     for (const line of lines) {
       if (inContent) { contentLines.push(line); continue; }
-      const mm = line.match(/^\s*(name|keys?|update|content)\s*:\s?(.*)$/i);
+      const mm = line.match(/^\s*(name|keys?|update|note|content)\s*:\s?(.*)$/i);
       if (!mm) continue;
       const f = mm[1].toLowerCase();
       const v = mm[2];
       if (f === "name") b.name = v.trim();
       else if (f === "update") b.update = v.trim();
+      else if (f === "note") b.note = v.trim().slice(0, 200);
       else if (f.startsWith("key")) b.keys = v.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 30);
       else {
         inContent = true;
@@ -346,8 +359,10 @@ function parseProposals(text) {
     }
     b.content = contentLines.join("\n").trim();
     if (!b.content) return whole;
-    if (b.action === "update" && !b.update) b.update = b.name;
-    if (!b.name) b.name = b.update || "Untitled entry";
+    if (kind === "lore") {
+      if (b.action === "update" && !b.update) b.update = b.name;
+      if (!b.name) b.name = b.update || "Untitled entry";
+    }
     blocks.push(b);
     return "";
   });
@@ -399,6 +414,7 @@ export function setup(ctx) {
     loreBudget: 1500,
     length: "auto",
     proposals: true,
+    chatEdits: true,
     systemPrompt: "",
   };
 
@@ -491,6 +507,10 @@ export function setup(ctx) {
   const propCb = el("input");
   propCb.type = "checkbox";
   propRow.append(propCb, el("span", "", "Allow lorebook proposals"));
+  const editRow = el("label", "cp-check");
+  const editCb = el("input");
+  editCb.type = "checkbox";
+  editRow.append(editCb, el("span", "", "Allow chat edit proposals"));
   const loreRow = el("label", "cp-check");
   const loreCb = el("input");
   loreCb.type = "checkbox";
@@ -517,7 +537,7 @@ export function setup(ctx) {
   const promptTa = el("textarea");
   const resetBtn = el("button", "cp-btn", "Reset prompt");
   resetBtn.style.alignSelf = "flex-start";
-  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, propRow, promptLabel, promptTa, resetBtn);
+  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, propRow, editRow, promptLabel, promptTa, resetBtn);
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
@@ -990,6 +1010,7 @@ export function setup(ctx) {
     lenSelect.value = settings.length || "auto";
     promptTa.value = settings.systemPrompt || defaultSystem;
     propCb.checked = settings.proposals !== false;
+    editCb.checked = settings.chatEdits !== false;
   }
 
   function commitCtx(n) {
@@ -1022,6 +1043,7 @@ export function setup(ctx) {
   cardCb.addEventListener("change", () => { settings.includeCard = cardCb.checked; saveSettings(); });
   personaCb.addEventListener("change", () => { settings.includePersona = personaCb.checked; saveSettings(); });
   propCb.addEventListener("change", () => { settings.proposals = propCb.checked; saveSettings(); });
+  editCb.addEventListener("change", () => { settings.chatEdits = editCb.checked; saveSettings(); });
   loreCb.addEventListener("change", () => { settings.includeLore = loreCb.checked; saveSettings(); });
   budgetNum.addEventListener("change", () => {
     settings.loreBudget = Math.max(200, Math.min(8000, Math.floor(Number(budgetNum.value) || 1500)));
@@ -1222,7 +1244,207 @@ export function setup(ctx) {
     box.append(msg, row);
   }
 
+  // ----- chat edit cards -----
+  const lookups = new Set();
+  const lookupErr = new Map();
+
+  function diffWords(a, b) {
+    const A = a.split(/(\s+)/);
+    const B = b.split(/(\s+)/);
+    const n = A.length;
+    const m = B.length;
+    if (n * m > 4000000) return null;
+    const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+    const out = [];
+    let i = 0;
+    let j = 0;
+    while (i < n && j < m) {
+      if (A[i] === B[j]) { out.push(["=", A[i]]); i++; j++; }
+      else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push(["-", A[i]]); i++; }
+      else { out.push(["+", B[j]]); j++; }
+    }
+    while (i < n) out.push(["-", A[i++]]);
+    while (j < m) out.push(["+", B[j++]]);
+    return out;
+  }
+
+  function diffEl(before, after) {
+    const box = el("div", "cp-diff");
+    box.addEventListener("click", () => box.classList.toggle("open"));
+    const ops = diffWords(before, after);
+    if (!ops) {
+      box.textContent = after;
+      return box;
+    }
+    let cur = null;
+    for (const [t, s] of ops) {
+      if (!cur || cur.t !== t) {
+        const node = t === "=" ? document.createTextNode("") : el("span", t === "+" ? "cp-add" : "cp-del");
+        cur = { t, node };
+        box.appendChild(node);
+      }
+      cur.node.textContent += s;
+    }
+    return box;
+  }
+
+  function plainEl(text) {
+    const box = el("div", "cp-diff", text);
+    box.addEventListener("click", () => box.classList.toggle("open"));
+    return box;
+  }
+
+  function ensureBase(i, k, block) {
+    const key = `${currentKey}|${i}|${k}`;
+    if (lookups.has(key) || lookupErr.has(key)) return;
+    lookups.add(key);
+    const keyAtStart = currentKey;
+    const msgRef = history[i];
+    rpc({ type: "chat_lookup", chatId: currentBase, index: block.message }).then((r) => {
+      lookups.delete(key);
+      if (currentKey !== keyAtStart || history[i] !== msgRef) return;
+      if (r && r.ok) {
+        setProp(i, k, {
+          chatId: currentBase,
+          chatName: r.chatName,
+          msgId: r.msgId,
+          msgRole: r.role,
+          before: r.content,
+        });
+      } else {
+        lookupErr.set(key, (r && r.error) || "unknown error");
+        renderHistory();
+      }
+    });
+  }
+
+  function openChatConfirm(card, area, i, k, st, content, block) {
+    area.style.display = "none";
+    const box = el("div", "cp-confirm");
+    box.appendChild(
+      el(
+        "div",
+        "",
+        `This will change message #${block.message} (${st.msgRole || "message"}) in “${st.chatName || "this chat"}”. The old text is saved here so you can undo.`,
+      ),
+    );
+    const msg = el("div", "cp-card-err");
+    msg.style.display = "none";
+    const row = el("div", "cp-card-actions");
+    const cancel = textBtn("Cancel", false, () => { box.remove(); area.style.display = ""; });
+    const go = textBtn("Apply change", true, async () => {
+      go.disabled = true;
+      cancel.disabled = true;
+      const r = await rpc({ type: "chat_apply", chatId: st.chatId, msgId: st.msgId, base: st.before, content });
+      if (r && r.ok) {
+        setProp(i, k, { status: "approved" });
+      } else {
+        go.disabled = false;
+        cancel.disabled = false;
+        msg.textContent = "Couldn't apply: " + ((r && r.error) || "unknown error");
+        msg.style.display = "";
+      }
+    });
+    row.append(go, cancel);
+    box.append(msg, row);
+    card.appendChild(box);
+  }
+
+  function startChatCardEdit(card, i, k, content) {
+    card.replaceChildren();
+    const ta = el("textarea", "cp-edit");
+    ta.value = content;
+    ta.style.minHeight = "160px";
+    const row = el("div", "cp-card-actions");
+    row.append(
+      textBtn("Save", true, () => {
+        const v = ta.value.trim();
+        if (v) setProp(i, k, { edit: { name: "", keys: [], content: v } });
+      }),
+      textBtn("Cancel", false, () => renderHistory()),
+    );
+    card.append(ta, row);
+  }
+
+  function buildChatCard(i, k, block) {
+    const m = history[i];
+    const st = (Array.isArray(m.props) && m.props[k]) || { status: "pending" };
+    const content = st.edit && st.edit.content ? st.edit.content : block.content;
+    const card = el("div", "cp-card " + st.status);
+    const key = `${currentKey}|${i}|${k}`;
+    const hasBase = typeof st.before === "string";
+
+    const label = `Edit chat message #${block.message}`;
+    const tag = { approved: "applied", rejected: "rejected", undone: "undone" }[st.status];
+    card.appendChild(el("div", "cp-card-head", tag ? `${label} · ${tag}` : label));
+    if (block.note) card.appendChild(el("div", "cp-card-keys", block.note));
+
+    if (hasBase) {
+      card.appendChild(
+        el("div", "cp-card-keys", `${st.msgRole || "message"} in ${st.chatName ? "“" + st.chatName + "”" : "this chat"}`),
+      );
+      const view = el("div");
+      let showDiff = true;
+      const toggle = textBtn("Show new text", false, () => {
+        showDiff = !showDiff;
+        draw();
+      });
+      toggle.style.cssText = "height:22px;padding:0 8px;font-size:11px;align-self:flex-start;";
+      const draw = () => {
+        view.replaceChildren(showDiff ? diffEl(st.before, content) : plainEl(content));
+        toggle.textContent = showDiff ? "Show new text" : "Show changes";
+      };
+      draw();
+      card.append(view, toggle);
+    } else if (lookupErr.has(key)) {
+      const e = el("div", "cp-card-err", "Couldn't load that message: " + lookupErr.get(key));
+      card.appendChild(e);
+      card.appendChild(textBtn("Try again", false, () => { lookupErr.delete(key); renderHistory(); }));
+    } else {
+      card.appendChild(el("div", "cp-dim", "Loading the current message…"));
+      if (st.status === "pending") ensureBase(i, k, block);
+    }
+
+    const area = el("div", "cp-card-actions");
+    const err = el("div", "cp-card-err");
+    err.style.display = "none";
+
+    if (st.status === "pending") {
+      const approve = textBtn("Approve", true, () => openChatConfirm(card, area, i, k, st, content, block));
+      approve.disabled = !hasBase;
+      area.append(
+        approve,
+        textBtn("Edit", false, () => startChatCardEdit(card, i, k, content)),
+        textBtn("Reject", false, () => setProp(i, k, { status: "rejected" })),
+      );
+    } else if (st.status === "approved") {
+      area.appendChild(el("span", "cp-dim", "Applied to the chat"));
+      const undo = textBtn("Undo", false, async () => {
+        undo.disabled = true;
+        const r = await rpc({ type: "chat_undo", chatId: st.chatId, msgId: st.msgId, prev: st.before, applied: content });
+        if (r && r.ok) {
+          setProp(i, k, { status: "undone" });
+        } else {
+          undo.disabled = false;
+          err.textContent = "Couldn't undo: " + ((r && r.error) || "unknown error");
+          err.style.display = "";
+        }
+      });
+      area.appendChild(undo);
+    } else {
+      area.appendChild(textBtn("Restore", false, () => setProp(i, k, { status: "pending" })));
+    }
+    card.append(area, err);
+    return card;
+  }
+
   function buildCard(i, k, block) {
+    if (block.kind === "chat") return buildChatCard(i, k, block);
     const m = history[i];
     const st = (Array.isArray(m.props) && m.props[k]) || { status: "pending" };
     const data = cardData(block, st);
@@ -1356,10 +1578,10 @@ export function setup(ctx) {
     if (!currentBubble) return;
     const p = parseProposals(assistantText);
     let t = p.text;
-    const open = t.search(/<lorebook_entry\b/i);
+    const open = t.search(/<(lorebook_entry|chat_edit)\b/i);
     if (open >= 0) t = t.slice(0, open).trimEnd();
     currentBubble.innerHTML =
-      renderMarkdown(t) + (open >= 0 ? '<p class="cp-dim">drafting a lorebook entry…</p>' : "");
+      renderMarkdown(t) + (open >= 0 ? '<p class="cp-dim">drafting a proposal…</p>' : "");
     log.scrollTop = log.scrollHeight;
   }
 
@@ -1496,7 +1718,10 @@ export function setup(ctx) {
       case "lore_targets":
       case "lore_lookup":
       case "lore_applied":
-      case "lore_undone": {
+      case "lore_undone":
+      case "chat_lookup":
+      case "chat_applied":
+      case "chat_undone": {
         const cb = pendingCbs.get(p.rid);
         if (cb) {
           pendingCbs.delete(p.rid);

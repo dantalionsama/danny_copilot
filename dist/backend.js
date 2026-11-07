@@ -26,6 +26,18 @@ To change an existing entry, use action="update" and add a line "update: <exact 
 If you can't see an entry's current text, ask the writer to paste it instead of guessing.
 The writer reviews and approves every block in the app, so don't explain the format or mention approval.`;
 
+const CHAT_EDIT_RULES = `CHAT EDIT PROPOSALS
+Messages in the roleplay context are numbered like [#143 assistant]. You can propose a rewrite of ONE of those messages, but ONLY when the writer explicitly asks you to fix, rewrite, shorten or otherwise change a specific message. Never propose unprompted. Only messages shown in the context can be edited.
+After your short reply, add one block per message, in exactly this format:
+
+<chat_edit message="143">
+note: one short line saying what you changed
+content:
+The COMPLETE new text of the message.
+</chat_edit>
+
+content replaces the whole message, so keep everything that should stay, including its formatting. The writer reviews and approves every edit in the app, so don't explain the format or mention approval.`;
+
 const DEFAULTS = {
   mode: "chat",
   ctxCount: 10,
@@ -36,6 +48,7 @@ const DEFAULTS = {
   loreBudget: 1500,
   length: "auto",
   proposals: true,
+  chatEdits: true,
   systemPrompt: "",
 };
 
@@ -70,9 +83,10 @@ function cleanProps(raw) {
   const out = raw.slice(0, 10).map((p) => {
     if (!p || typeof p !== "object") return { status: "pending" };
     const o = { status: PROP_STATUS.includes(p.status) ? p.status : "pending" };
-    for (const f of ["action", "bookId", "bookName", "entryId"]) {
+    for (const f of ["action", "bookId", "bookName", "entryId", "chatId", "chatName", "msgId", "msgRole"]) {
       if (typeof p[f] === "string") o[f] = p[f].slice(0, 300);
     }
+    if (typeof p.before === "string") o.before = p.before.slice(0, 100000);
     if (p.prev && typeof p.prev === "object") {
       o.prev = {
         key: strArr(p.prev.key, 200, 300),
@@ -113,6 +127,7 @@ function cleanSettings(s) {
     if (Number.isFinite(lb)) o.loreBudget = Math.max(200, Math.min(8000, Math.floor(lb)));
     if (["auto", "short", "medium", "long"].includes(s.length)) o.length = s.length;
     o.proposals = s.proposals !== false;
+    o.chatEdits = s.chatEdits !== false;
     if (typeof s.systemPrompt === "string") o.systemPrompt = s.systemPrompt.slice(0, 8000);
   }
   return o;
@@ -148,6 +163,13 @@ async function readMessages(chatId) {
   } catch (e) {
     return await spindle.chat.getMessages(chatId);
   }
+}
+
+async function assertChat(chatId, userId) {
+  if (!chatId || chatId === "general") throw new Error("Chat edits only work in “This chat” mode.");
+  const chat = await spindle.chats.get(String(chatId), userId);
+  if (!chat) throw new Error("That chat isn't available.");
+  return chat;
 }
 
 // ---------- sessions (a list per chat, plus one for General) ----------
@@ -537,6 +559,14 @@ async function buildContext(userId, settings, opts = {}) {
     });
   }
 
+  if (settings.chatEdits && useChat) {
+    sections.push({
+      id: "chatedits",
+      label: "Chat edit proposals (instructions)",
+      text: CHAT_EDIT_RULES,
+    });
+  }
+
   // attachments: text files go into the system message, images ride on the last user message
   let images = [];
   let imgTokensTotal = 0;
@@ -643,7 +673,7 @@ async function buildContext(userId, settings, opts = {}) {
       let prev = -2;
       for (const x of chosen) {
         if (prev >= 0 && x.i - prev > 1) parts.push("[…]");
-        parts.push(`[${x.m.role}] ${x.m.content}`);
+        parts.push(`[${settings.chatEdits ? "#" + x.i + " " : ""}${x.m.role}] ${x.m.content}`);
         prev = x.i;
       }
       sections.push({
@@ -1076,6 +1106,69 @@ spindle.onFrontendMessage(async (payload, userId) => {
         spindle.sendToFrontend({ type: "files", files: lightFiles(shelf.items) }, userId);
       } catch (e) {
         spindle.log.warn("[Copilot] file update failed: " + e.message);
+      }
+      break;
+    }
+
+
+    case "chat_lookup": {
+      const rid = payload.rid;
+      try {
+        const chat = await assertChat(String(payload.chatId || ""), userId);
+        const msgs = await readMessages(chat.id);
+        const idx = Math.floor(Number(payload.index));
+        if (!(idx >= 0 && idx < msgs.length)) throw new Error(`There is no message #${payload.index} in this chat.`);
+        const m = msgs[idx];
+        spindle.sendToFrontend({
+          type: "chat_lookup", rid, ok: true,
+          msgId: String(m.id), role: m.role, content: String(m.content || ""), chatName: String(chat.name || ""),
+        }, userId);
+      } catch (e) {
+        spindle.sendToFrontend({ type: "chat_lookup", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
+    case "chat_apply": {
+      const rid = payload.rid;
+      try {
+        const chat = await assertChat(String(payload.chatId || ""), userId);
+        const content = clip(payload.content, 100000);
+        if (!content.trim()) throw new Error("The new message is empty.");
+        const msgs = await readMessages(chat.id);
+        const cur = msgs.find((m) => String(m.id) === String(payload.msgId));
+        if (!cur) throw new Error("That message no longer exists.");
+        if (String(cur.content || "") !== String(payload.base || "")) {
+          throw new Error("That message was changed after this card was made, so I didn't overwrite it. Reject this card and ask Danny again.");
+        }
+        await spindle.chat.updateMessage(chat.id, cur.id, { content });
+        loreCache.clear();
+        spindle.sendToFrontend({ type: "chat_applied", rid, ok: true }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] chat_apply failed: " + e.message);
+        spindle.sendToFrontend({ type: "chat_applied", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
+    case "chat_undo": {
+      const rid = payload.rid;
+      try {
+        const chat = await assertChat(String(payload.chatId || ""), userId);
+        const prev = clip(payload.prev, 100000);
+        if (!prev.trim()) throw new Error("The old version wasn't saved.");
+        const msgs = await readMessages(chat.id);
+        const cur = msgs.find((m) => String(m.id) === String(payload.msgId));
+        if (!cur) throw new Error("That message no longer exists.");
+        if (String(cur.content || "") !== String(payload.applied || "")) {
+          throw new Error("That message was edited again after Danny's change, so I won't overwrite it.");
+        }
+        await spindle.chat.updateMessage(chat.id, cur.id, { content: prev });
+        loreCache.clear();
+        spindle.sendToFrontend({ type: "chat_undone", rid, ok: true }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] chat_undo failed: " + e.message);
+        spindle.sendToFrontend({ type: "chat_undone", rid, ok: false, error: e.message }, userId);
       }
       break;
     }
