@@ -192,6 +192,7 @@ async function sendInit(userId) {
   const connections = await spindle.connections.list(userId);
   const sessions = await getSessions(key, userId);
   const history = await loadHistory(sessPath(key, sessions.active), userId);
+  const shelf = await getShelf(userId, key, sessions.active);
   spindle.sendToFrontend({
     type: "init",
     connections: connections.map((c) => ({
@@ -205,6 +206,7 @@ async function sendInit(userId) {
     sessionId: sessions.active,
     sessions,
     history,
+    files: lightFiles(shelf.items),
     settings,
     defaultSystem: DEFAULT_SYSTEM,
   }, userId);
@@ -261,6 +263,70 @@ async function savePick(chatId, userId, pick) {
   } catch (e) {
     spindle.log.warn("[Copilot] save pick failed: " + e.message);
   }
+}
+
+// ---------- attachments (one shelf of files per session) ----------
+const filesCache = new Map();
+const filesPath = (key, sid) => `copilot_files_${san(key)}_${san(sid)}.json`;
+const MAX_FILES = 12;
+const MAX_IMAGES = 6;
+const MAX_TEXT_TOTAL = 300000;
+const newId = () => "f" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const estImg = (w, h) => Math.min(1600, Math.ceil((w * h) / 750));
+
+function cleanShelf(raw) {
+  const items = [];
+  for (const x of Array.isArray(raw && raw.items) ? raw.items : []) {
+    if (!x || typeof x !== "object" || typeof x.id !== "string") continue;
+    const base = { id: san(x.id).slice(0, 40), name: clip(x.name, 120) || "file", on: x.on !== false };
+    if (x.kind === "text" && typeof x.text === "string") {
+      items.push({ ...base, kind: "text", text: x.text.slice(0, 60000), truncated: x.truncated === true });
+    } else if (x.kind === "image" && typeof x.data === "string" && typeof x.thumb === "string") {
+      const w = Math.floor(Number(x.w));
+      const h = Math.floor(Number(x.h));
+      if (w >= 1 && w <= 4096 && h >= 1 && h <= 4096) {
+        items.push({ ...base, kind: "image", data: x.data, mime: "image/jpeg", w, h, thumb: x.thumb });
+      }
+    }
+  }
+  return { items: items.slice(0, MAX_FILES) };
+}
+
+async function getShelf(userId, key, sid) {
+  const ck = `${uk(userId)}|${key}|${sid}`;
+  if (filesCache.has(ck)) return filesCache.get(ck);
+  let raw = {};
+  try {
+    raw = await spindle.userStorage.getJson(filesPath(key, sid), { fallback: {}, userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] load attachments failed: " + e.message);
+  }
+  const shelf = { key, sid, items: cleanShelf(raw).items };
+  if (filesCache.size > 8) filesCache.clear();
+  filesCache.set(ck, shelf);
+  return shelf;
+}
+
+async function saveShelf(userId, shelf) {
+  try {
+    await spindle.userStorage.setJson(filesPath(shelf.key, shelf.sid), { items: shelf.items }, { userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] save attachments failed: " + e.message);
+  }
+}
+
+const itemTokens = (x) => (x.kind === "image" ? estImg(x.w, x.h) : Math.ceil(x.text.length / 4));
+
+function lightFiles(items) {
+  return items.map((x) => ({
+    id: x.id,
+    kind: x.kind,
+    name: x.name,
+    on: x.on,
+    tokens: itemTokens(x),
+    thumb: x.kind === "image" ? x.thumb : undefined,
+    truncated: x.truncated || undefined,
+  }));
 }
 
 // ---------- lorebook books and entries (for proposals) ----------
@@ -471,6 +537,34 @@ async function buildContext(userId, settings, opts = {}) {
     });
   }
 
+  // attachments: text files go into the system message, images ride on the last user message
+  let images = [];
+  let imgTokensTotal = 0;
+  try {
+    const shelfKey = useChat ? active.id : "general";
+    const sidx = await getSessions(shelfKey, userId);
+    const shelf = await getShelf(userId, shelfKey, sidx.active);
+    shelf.items
+      .filter((x) => x.on && x.kind === "text")
+      .forEach((x, i) => {
+        sections.push({
+          id: `file${i}`,
+          label: `Attachment: ${x.name}`,
+          text: `<attached_file name="${x.name}">\n${x.text}\n</attached_file>`,
+        });
+      });
+    const imgs = shelf.items.filter((x) => x.on && x.kind === "image");
+    imgTokensTotal = imgs.reduce((a, x) => a + itemTokens(x), 0);
+    if (imgs.length) {
+      notes.push(
+        `${imgs.length} image${imgs.length > 1 ? "s" : ""} attached (~${imgTokensTotal} tokens). Needs a vision-capable model.`,
+      );
+      if (opts.forSend) images = imgs.map((x) => ({ data: x.data, mime: x.mime }));
+    }
+  } catch (e) {
+    spindle.log.warn("[Copilot] attachments failed: " + e.message);
+  }
+
   if (useChat) {
     if (settings.includeCard && active.character_id) {
       try {
@@ -589,17 +683,17 @@ async function buildContext(userId, settings, opts = {}) {
     text: x.text,
   }));
 
-  return { sections, notes, useChat, lore, msgs: msgsInfo };
+  return { sections, notes, useChat, lore, msgs: msgsInfo, images, imgTokens: imgTokensTotal };
 }
 
 async function sendPreview(userId) {
   const settings = await getSettings(userId);
   const limit = limitCache[uk(userId)] || 60;
-  const { sections, notes, useChat, lore, msgs } = await buildContext(userId, settings, {
+  const { sections, notes, useChat, lore, msgs, imgTokens } = await buildContext(userId, settings, {
     withMessages: true,
     limit,
   });
-  spindle.sendToFrontend({ type: "context_preview", sections, notes, useChat, lore, msgs }, userId);
+  spindle.sendToFrontend({ type: "context_preview", sections, notes, useChat, lore, msgs, imgTokens }, userId);
 }
 
 spindle.log.info("[Copilot] backend started");
@@ -672,6 +766,8 @@ spindle.onFrontendMessage(async (payload, userId) => {
         const pos = idx.list.findIndex((s) => s.id === sid);
         if (pos < 0) break;
         await spindle.userStorage.setJson(sessPath(key, sid), [], { userId });
+        filesCache.clear();
+        await spindle.userStorage.setJson(filesPath(key, sid), { items: [] }, { userId });
         let list = idx.list.filter((s) => s.id !== sid);
         if (!list.length) list = [{ id: "s1", name: "Session 1" }];
         const active = idx.active === sid ? list[Math.max(0, pos - 1)].id : idx.active;
@@ -911,6 +1007,79 @@ spindle.onFrontendMessage(async (payload, userId) => {
       break;
     }
 
+    case "file_add": {
+      try {
+        const { key } = await resolveKey(userId);
+        const sidx = await getSessions(key, userId);
+        const shelf = await getShelf(userId, key, sidx.active);
+        const name = clip(payload.name, 120).trim() || "file";
+        let error;
+
+        if (shelf.items.length >= MAX_FILES) {
+          error = `You can attach up to ${MAX_FILES} files per session.`;
+        } else if (payload.kind === "image") {
+          const w = Math.floor(Number(payload.w));
+          const h = Math.floor(Number(payload.h));
+          const data = String(payload.data || "");
+          const thumb = String(payload.thumb || "");
+          if (shelf.items.filter((x) => x.kind === "image").length >= MAX_IMAGES) {
+            error = `You can attach up to ${MAX_IMAGES} images per session.`;
+          } else if (
+            !(w >= 1 && w <= 4096 && h >= 1 && h <= 4096) ||
+            !data || data.length > 1500000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data) ||
+            thumb.length > 30000 || !/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(thumb)
+          ) {
+            error = "That image couldn't be read.";
+          } else {
+            shelf.items.push({ id: newId(), kind: "image", name, on: true, data, mime: "image/jpeg", w, h, thumb });
+          }
+        } else {
+          const raw = String(payload.text || "");
+          const textTotal = shelf.items.filter((x) => x.kind === "text").reduce((a, x) => a + x.text.length, 0);
+          if (!raw.trim()) error = "That file is empty.";
+          else if (textTotal + Math.min(raw.length, 60000) > MAX_TEXT_TOTAL) {
+            error = "That would be too much text for one session. Remove a file first.";
+          } else {
+            shelf.items.push({
+              id: newId(), kind: "text", name, on: true,
+              text: raw.slice(0, 60000), truncated: raw.length > 60000,
+            });
+          }
+        }
+
+        if (!error) await saveShelf(userId, shelf);
+        spindle.sendToFrontend({ type: "files", files: lightFiles(shelf.items), error }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] file_add failed: " + e.message);
+        spindle.sendToFrontend({ type: "files", error: "Couldn't attach that file." }, userId);
+      }
+      break;
+    }
+
+    case "file_toggle":
+    case "file_remove":
+    case "file_clear": {
+      try {
+        const { key } = await resolveKey(userId);
+        const sidx = await getSessions(key, userId);
+        const shelf = await getShelf(userId, key, sidx.active);
+        const id = String(payload.id || "");
+        if (payload.type === "file_toggle") {
+          const it = shelf.items.find((x) => x.id === id);
+          if (it) it.on = typeof payload.on === "boolean" ? payload.on : !it.on;
+        } else if (payload.type === "file_remove") {
+          shelf.items = shelf.items.filter((x) => x.id !== id);
+        } else {
+          shelf.items = [];
+        }
+        await saveShelf(userId, shelf);
+        spindle.sendToFrontend({ type: "files", files: lightFiles(shelf.items) }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] file update failed: " + e.message);
+      }
+      break;
+    }
+
     case "save_settings": {
       const s = cleanSettings(payload.settings);
       cache[uk(userId)] = s;
@@ -948,16 +1117,21 @@ spindle.onFrontendMessage(async (payload, userId) => {
 
       try {
         const settings = await getSettings(userId);
-        const { sections } = await buildContext(userId, settings);
+        const { sections, images } = await buildContext(userId, settings, { forSend: true });
 
         const past = cleanHistory(payload.history)
           .slice(-40)
           .map(({ role, content }) => ({ role, content }));
 
+        const text = String(payload.text || "");
+        const lastContent = images.length
+          ? [{ type: "text", text }, ...images.map((im) => ({ type: "image", data: im.data, mime_type: im.mime }))]
+          : text;
+
         const messages = [
           { role: "system", content: sections.map((s) => s.text).join("\n\n") },
           ...past,
-          { role: "user", content: String(payload.text || "") },
+          { role: "user", content: lastContent },
         ];
 
         const input = { type: "quiet", messages, userId, signal: ctl.signal };

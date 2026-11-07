@@ -14,6 +14,9 @@ const ICONS = {
   check: '<polyline points="20 6 9 17 4 12"/>',
   layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
   pin: '<line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/>',
+  paperclip: '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  x: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>',
   plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
 };
 
@@ -152,6 +155,17 @@ const STYLES = `
   .cp-confirm { display:flex; flex-direction:column; gap:8px; padding:8px 10px; font-size:12px; line-height:1.4;
     background:var(--cp-tint); border:1px solid color-mix(in srgb, var(--cp-primary) 40%, transparent);
     border-radius:var(--cp-radius); }
+
+  .cp-clip { width:38px; height:38px; flex:none; display:grid; place-items:center; padding:0; cursor:pointer;
+    background:var(--cp-surface); border:1px solid var(--cp-border); border-radius:50%; }
+  .cp-clip:hover { background:var(--cp-fill-hover); }
+  .cp-chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .cp-chip { display:flex; align-items:center; gap:6px; max-width:100%; padding:3px 4px 3px 7px; font-size:11px;
+    cursor:pointer; background:var(--cp-fill); border:1px solid var(--cp-border); border-radius:999px; }
+  .cp-chip.off { opacity:0.5; }
+  .cp-chip-name { max-width:120px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .cp-thumb { width:18px; height:18px; object-fit:cover; border-radius:4px; flex:none; }
+  .cp-chip .cp-act { width:18px; height:18px; }
 
   .cp-inputbar { display:flex; align-items:flex-end; gap:8px; }
   .cp-input { flex:1; min-width:0; resize:none; min-height:38px; max-height:140px; padding:9px 14px; line-height:1.4;
@@ -370,6 +384,9 @@ export function setup(ctx) {
   let pickScrollTop = null;
   let ridN = 0;
   const pendingCbs = new Map();
+  let files = [];
+  let ctxImgTokens = 0;
+  let noteTimer = 0;
   let sessions = { active: null, list: [] };
   const openIds = new Set();
   let settings = {
@@ -520,12 +537,134 @@ export function setup(ctx) {
   input.rows = 1;
   input.placeholder = "Ask about the roleplay…";
   const sendBtn = el("button", "cp-send");
-  inputBar.append(input, sendBtn);
+  const clipBtn = el("button", "cp-clip");
+  clipBtn.innerHTML = svg(ICONS.paperclip, 18);
+  clipBtn.title = "Attach text files or images";
+  clipBtn.setAttribute("aria-label", "Attach files");
+  const fileInput = el("input");
+  fileInput.type = "file";
+  fileInput.multiple = true;
+  fileInput.accept = "image/*,text/*,.txt,.md,.markdown,.json,.csv,.log,.html,.xml,.yaml,.yml,.srt,.vtt,.rtf";
+  fileInput.style.display = "none";
+  clipBtn.addEventListener("click", () => fileInput.click());
+  inputBar.append(clipBtn, input, sendBtn, fileInput);
+
+  const chipBar = el("div", "cp-chips");
+  chipBar.style.display = "none";
+
+  function renderChips(note) {
+    chipBar.replaceChildren();
+    for (const f of files) {
+      const chip = el("div", "cp-chip" + (f.on ? "" : " off"));
+      chip.title = (f.on ? "Included. Click to leave it out: " : "Left out. Click to include: ") + f.name;
+      if (f.kind === "image" && f.thumb) {
+        const im = el("img", "cp-thumb");
+        im.src = f.thumb;
+        chip.appendChild(im);
+      } else {
+        const ico = el("span", "cp-ico");
+        ico.innerHTML = svg(ICONS.file, 14);
+        chip.appendChild(ico);
+      }
+      chip.append(el("span", "cp-chip-name", f.name), el("span", "cp-dim", "~" + fmt(f.tokens)));
+      const rm = actBtn(ICONS.x, "Remove", (e) => {
+        e.stopPropagation();
+        ctx.sendToBackend({ type: "file_remove", id: f.id });
+      });
+      chip.appendChild(rm);
+      chip.addEventListener("click", () => ctx.sendToBackend({ type: "file_toggle", id: f.id, on: !f.on }));
+      chipBar.appendChild(chip);
+    }
+    if (note) {
+      const n = el("div", "cp-card-err", note);
+      n.style.width = "100%";
+      chipBar.appendChild(n);
+    }
+    chipBar.style.display = files.length || note ? "flex" : "none";
+  }
+
+  function flashNote(msg) {
+    renderChips(msg);
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(() => renderChips(), 6000);
+  }
+
+  function loadImage(url) {
+    return new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = () => reject(new Error("can't read this image"));
+      im.src = url;
+    });
+  }
+
+  function drawJpeg(img, w, h, q) {
+    const c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    const g = c.getContext("2d");
+    g.fillStyle = "#fff";
+    g.fillRect(0, 0, w, h);
+    g.drawImage(img, 0, 0, w, h);
+    return c.toDataURL("image/jpeg", q);
+  }
+
+  async function prepareImage(file) {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await loadImage(url);
+      const w0 = img.naturalWidth;
+      const h0 = img.naturalHeight;
+      if (!w0 || !h0) throw new Error("can't read this image");
+      let max = 1280;
+      let q = 0.82;
+      let data = "";
+      let w = 0;
+      let h = 0;
+      for (let pass = 0; pass < 4; pass++) {
+        const s = Math.min(1, max / Math.max(w0, h0));
+        w = Math.max(1, Math.round(w0 * s));
+        h = Math.max(1, Math.round(h0 * s));
+        data = drawJpeg(img, w, h, q).split(",")[1] || "";
+        if (data.length <= 1000000) break;
+        max = Math.round(max * 0.75);
+        q = Math.max(0.6, q - 0.08);
+      }
+      if (!data || data.length > 1400000) throw new Error("that image is too large");
+      const ts = Math.min(1, 72 / Math.max(w0, h0));
+      const thumb = drawJpeg(img, Math.max(1, Math.round(w0 * ts)), Math.max(1, Math.round(h0 * ts)), 0.6);
+      return { data, w, h, thumb };
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  fileInput.addEventListener("change", async () => {
+    const list = Array.from(fileInput.files || []);
+    fileInput.value = "";
+    for (const f of list) {
+      try {
+        if (f.type.startsWith("image/")) {
+          if (f.size > 20 * 1024 * 1024) throw new Error("that image is over 20 MB");
+          const im = await prepareImage(f);
+          ctx.sendToBackend({ type: "file_add", kind: "image", name: f.name, ...im });
+        } else {
+          if (f.size > 400 * 1024) throw new Error("that file is over 400 KB");
+          const text = await f.text();
+          const bad = (text.slice(0, 4000).match(/[\u0000\uFFFD]/g) || []).length;
+          if (bad > 20) throw new Error("that doesn't look like a text file");
+          ctx.sendToBackend({ type: "file_add", kind: "text", name: f.name, text });
+        }
+      } catch (e) {
+        flashNote(`Couldn't attach ${f.name}: ${e.message}`);
+      }
+    }
+  });
 
   const topGroup = el("div", "cp-top");
   topGroup.append(topRow, connRow, sessRow);
   const bottomGroup = el("div", "cp-bottom");
-  bottomGroup.append(foot, inputBar);
+  bottomGroup.append(foot, chipBar, inputBar);
   root.append(topGroup, setPanel, chatLine, log, ctxView, bottomGroup);
   tab.root.appendChild(root);
 
@@ -610,6 +749,7 @@ export function setup(ctx) {
   function totalTokens() {
     let total = 0;
     for (const s of ctxSections || []) total += est(s.text);
+    total += ctxImgTokens;
     total += est(convoText());
     return total;
   }
@@ -1311,6 +1451,8 @@ export function setup(ctx) {
 
         sessions = p.sessions || { active: p.sessionId, list: [] };
         renderSessionSelect();
+        files = Array.isArray(p.files) ? p.files : [];
+        renderChips();
 
         const general = settings.mode === "general" || !p.chat;
         chatLine.textContent =
@@ -1347,6 +1489,7 @@ export function setup(ctx) {
         ctxNotes = Array.isArray(p.notes) ? p.notes : [];
         ctxLore = Array.isArray(p.lore) ? p.lore : [];
         ctxMsgs = p.msgs || null;
+        ctxImgTokens = Number(p.imgTokens) || 0;
         updateReadout();
         if (ctxOpen) renderContextView();
         break;
@@ -1361,6 +1504,13 @@ export function setup(ctx) {
         }
         break;
       }
+      case "files":
+        if (Array.isArray(p.files)) files = p.files;
+        if (p.error) flashNote(p.error);
+        else renderChips();
+        updateReadout();
+        requestPreview();
+        break;
       case "token":
         if (p.reqId !== reqId || !currentBubble) return;
         assistantText += p.token;
