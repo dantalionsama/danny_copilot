@@ -3,6 +3,24 @@ Help with brainstorming, plot ideas, character analysis, lore and scene review.
 Never write dialogue or actions for the user's character, and never continue the roleplay.
 Be concise and direct.`;
 
+const DEFAULT_VOICES = {
+  danny: {
+    name: "Danny",
+    text: `Your name is Danny. You talk like the chronically online AO3 writer friend everyone has: lowercase, short forms (tbh, ngl, imo, lbr), CAPSLOCK for emphasis, and sparse kaomojis like (ᗒᗣᗕ)՞ or (●ˇ∀ˇ●). Warm, a little chaotic, easily obsessed with the writer's characters and ships. Keep your response concise unless the writer asks for more.`,
+  },
+  blair: {
+    name: "Blair",
+    text: `Your name is Blair. You're a rich, sassy, flirty bestie straight out of stan twt: confident, dramatic and here to have fun. Use stan twt and drag-scene slang naturally, not in every sentence (mother, serve, ate, slay, cunt as a term of praise, iconic, the way I gasped, gag). Tease the writer playfully and never meanly, be flirty, and think Gina Linetti: unbothered, self-assured, hilarious. You LOVE character building: get excited about motivations, flaws, contradictions and tiny habits that make a character feel real. Underneath the sass, your feedback is still honest and useful. Keep replies punchy.`,
+  },
+  woinker: {
+    name: "Woinker",
+    text: `Your name is Woinker. You are the dry, impeccably British manager of a galactic restaurant at the edge of known space. Understated wit, polite exasperation, a fondness for "rather", "quite" and "I daresay". You adore world-building and treat settings like a menu: cultures, politics, economies and customs are courses, and you always notice what a world eats, grows, trades and cooks. Weave in food talk, both ordinary (a proper roast) and galactic (nebula broth, void-aged cheese), without overdoing it. Stay genuinely helpful beneath the deadpan. Keep replies compact.`,
+  },
+};
+const VOICE_NOTE =
+  "\n\nYour voice applies to your normal replies only. Anything you write inside lorebook entries or chat edits must be clean, neutral prose that fits the roleplay, never in your voice.";
+const isVoice = (v) => v === "default" || Object.prototype.hasOwnProperty.call(DEFAULT_VOICES, v);
+
 const LENGTH_RULES = {
   auto: "",
   short: "Keep replies short: usually 2-6 sentences, under 150 words. No headers or long lists unless the writer asks for more detail.",
@@ -49,6 +67,8 @@ const DEFAULTS = {
   length: "auto",
   proposals: true,
   chatEdits: true,
+  voice: "default",
+  voiceTexts: {},
   systemPrompt: "",
 };
 
@@ -129,6 +149,21 @@ function cleanSettings(s) {
     o.proposals = s.proposals !== false;
     o.chatEdits = s.chatEdits !== false;
     if (typeof s.systemPrompt === "string") o.systemPrompt = s.systemPrompt.slice(0, 8000);
+    if (isVoice(s.voice)) o.voice = s.voice;
+    const vt = {};
+    if (s.voiceTexts && typeof s.voiceTexts === "object") {
+      for (const id of Object.keys(DEFAULT_VOICES)) {
+        if (typeof s.voiceTexts[id] === "string" && s.voiceTexts[id].trim()) {
+          vt[id] = s.voiceTexts[id].slice(0, 2000);
+        }
+      }
+    }
+    o.voiceTexts = vt;
+    // one-time move: an old custom "AO3 Danny" system prompt becomes the Danny voice
+    if (typeof s.voice !== "string" && /\bAO3\b/i.test(o.systemPrompt)) {
+      o.systemPrompt = "";
+      o.voice = "danny";
+    }
   }
   return o;
 }
@@ -231,6 +266,7 @@ async function sendInit(userId) {
     files: lightFiles(shelf.items),
     settings,
     defaultSystem: DEFAULT_SYSTEM,
+    defaultVoices: DEFAULT_VOICES,
   }, userId);
 }
 
@@ -528,6 +564,11 @@ async function buildContext(userId, settings, opts = {}) {
   const sections = [
     { id: "system", label: "System prompt", text: settings.systemPrompt.trim() || DEFAULT_SYSTEM },
   ];
+  if (settings.voice !== "default" && DEFAULT_VOICES[settings.voice]) {
+    const dv = DEFAULT_VOICES[settings.voice];
+    const vtext = (settings.voiceTexts[settings.voice] || "").trim() || dv.text;
+    sections.push({ id: "voice", label: `Voice: ${dv.name}`, text: `VOICE\n${vtext}${VOICE_NOTE}` });
+  }
   const notes = [];
   let loreItems = [];
   let msgsInfo = null;

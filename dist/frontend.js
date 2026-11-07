@@ -18,6 +18,8 @@ const ICONS = {
   x: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
   file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>',
   plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
+  maximize: '<path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>',
+  minimize: '<path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>',
 };
 
 const STYLES = `
@@ -173,6 +175,25 @@ const STYLES = `
   .cp-add { background:color-mix(in srgb, var(--lumiverse-success, #3fb27f) 28%, transparent); border-radius:3px; }
   .cp-del { background:color-mix(in srgb, var(--lumiverse-danger, #e5484d) 28%, transparent);
     text-decoration:line-through; opacity:0.85; border-radius:3px; }
+
+  .cp-side { display:none; flex-direction:column; gap:8px; min-height:0; overflow-y:auto; scrollbar-width:thin; }
+  .cp-root.cp-full { position:fixed; inset:0; z-index:2147483000; width:100vw; height:100vh; height:100dvh;
+    padding:14px 18px; background:var(--lumiverse-bg, #0d0d11); overflow:hidden; }
+  .cp-full .cp-top, .cp-full .cp-bottom { position:static; margin:0; padding:0; background:none;
+    -webkit-backdrop-filter:none; backdrop-filter:none; }
+  .cp-full:not(.wide) > .cp-top, .cp-full:not(.wide) > .cp-chatline,
+  .cp-full:not(.wide) > .cp-log, .cp-full:not(.wide) > .cp-bottom { width:100%; max-width:900px; align-self:center; }
+  .cp-root.cp-full.wide { display:grid; grid-template-columns:minmax(0,1fr) minmax(340px,420px);
+    grid-template-rows:auto auto minmax(0,1fr) auto; column-gap:18px; row-gap:8px; }
+  .cp-root.cp-full.wide.noside { grid-template-columns:minmax(0,1fr); }
+  .cp-full.wide > .cp-top { grid-column:1; grid-row:1; }
+  .cp-full.wide > .cp-chatline { grid-column:1; grid-row:2; }
+  .cp-full.wide > .cp-log { grid-column:1; grid-row:3; }
+  .cp-full.wide > .cp-bottom { grid-column:1; grid-row:4; }
+  .cp-full.wide > .cp-side { grid-column:2; grid-row:1 / 5; }
+  .cp-full.wide > .cp-side.show { display:flex; }
+  .cp-full.wide > .cp-top, .cp-full.wide > .cp-chatline, .cp-full.wide > .cp-log,
+  .cp-full.wide > .cp-bottom { width:100%; max-width:900px; justify-self:center; }
 
   .cp-inputbar { display:flex; align-items:flex-end; gap:8px; }
   .cp-input { flex:1; min-width:0; resize:none; min-height:38px; max-height:140px; padding:9px 14px; line-height:1.4;
@@ -403,6 +424,8 @@ export function setup(ctx) {
   let files = [];
   let ctxImgTokens = 0;
   let noteTimer = 0;
+  let hasChat = false;
+  let defaultVoices = {};
   let sessions = { active: null, list: [] };
   const openIds = new Set();
   let settings = {
@@ -416,6 +439,8 @@ export function setup(ctx) {
     length: "auto",
     proposals: true,
     chatEdits: true,
+    voice: "default",
+    voiceTexts: {},
     systemPrompt: "",
   };
 
@@ -470,7 +495,8 @@ export function setup(ctx) {
   ctxWrap.append(el("span", "", "CTX"), ctxRange);
 
   const settingsBtn = iconBtn(ICONS.sliders, "Settings");
-  topRow.append(modeSelect, ctxWrap, ctxNum, settingsBtn);
+  const fullBtn = iconBtn(ICONS.maximize, "Fullscreen");
+  topRow.append(modeSelect, ctxWrap, ctxNum, settingsBtn, fullBtn);
 
   // row 2: connection
   const connRow = el("div", "cp-row");
@@ -512,6 +538,14 @@ export function setup(ctx) {
   const editCb = el("input");
   editCb.type = "checkbox";
   editRow.append(editCb, el("span", "", "Allow chat edit proposals"));
+  const voiceRow = el("label", "cp-check");
+  const voiceSelect = el("select", "cp-sel");
+  voiceSelect.style.width = "150px";
+  voiceRow.append(el("span", "", "Assistant voice"), voiceSelect);
+  const voiceTa = el("textarea");
+  voiceTa.style.height = "90px";
+  const voiceReset = el("button", "cp-btn", "Reset voice");
+  voiceReset.style.alignSelf = "flex-start";
   const loreRow = el("label", "cp-check");
   const loreCb = el("input");
   loreCb.type = "checkbox";
@@ -538,7 +572,7 @@ export function setup(ctx) {
   const promptTa = el("textarea");
   const resetBtn = el("button", "cp-btn", "Reset prompt");
   resetBtn.style.alignSelf = "flex-start";
-  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, propRow, editRow, promptLabel, promptTa, resetBtn);
+  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, propRow, editRow, voiceRow, voiceTa, voiceReset, promptLabel, promptTa, resetBtn);
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
@@ -686,13 +720,81 @@ export function setup(ctx) {
   topGroup.append(topRow, connRow, sessRow);
   const bottomGroup = el("div", "cp-bottom");
   bottomGroup.append(foot, chipBar, inputBar);
-  root.append(topGroup, setPanel, chatLine, log, ctxView, bottomGroup);
+  chatLine.classList.add("cp-chatline");
+  const side = el("div", "cp-side");
+  root.append(topGroup, setPanel, chatLine, log, ctxView, bottomGroup, side);
   tab.root.appendChild(root);
 
   input.addEventListener("input", () => {
     input.style.height = "auto";
     input.style.height = Math.min(input.scrollHeight, 140) + "px";
   });
+
+  // ---------- fullscreen ----------
+  let full = false;
+  let fullWide = false;
+  let autoCtx = false;
+
+  function updateSide() {
+    const show = full && fullWide && (ctxOpen || setPanel.classList.contains("open"));
+    side.classList.toggle("show", show);
+    root.classList.toggle("noside", full && fullWide && !show);
+  }
+
+  function layoutFull() {
+    if (!full) return;
+    fullWide = window.innerWidth >= 1000;
+    root.classList.toggle("wide", fullWide);
+    if (fullWide) {
+      side.append(setPanel, ctxView);
+    } else {
+      root.insertBefore(setPanel, chatLine);
+      root.insertBefore(ctxView, bottomGroup);
+    }
+    log.style.display = ctxOpen && !fullWide ? "none" : "";
+    updateSide();
+  }
+
+  function setFull(v) {
+    if (v === full) return;
+    if (v) {
+      full = true;
+      document.body.appendChild(root);
+      root.classList.add("cp-full");
+      layoutFull();
+      if (fullWide && !ctxOpen) {
+        autoCtx = true;
+        setCtxOpen(true);
+      }
+    } else {
+      if (autoCtx) {
+        autoCtx = false;
+        setCtxOpen(false);
+      }
+      full = false;
+      fullWide = false;
+      root.classList.remove("cp-full", "wide", "noside");
+      side.classList.remove("show");
+      tab.root.appendChild(root);
+      root.insertBefore(setPanel, chatLine);
+      root.insertBefore(ctxView, bottomGroup);
+      log.style.display = ctxOpen ? "none" : "";
+    }
+    fullBtn.innerHTML = svg(full ? ICONS.minimize : ICONS.maximize, 16);
+    fullBtn.title = full ? "Exit fullscreen (Esc)" : "Fullscreen";
+    fullBtn.classList.toggle("on", full);
+  }
+
+  fullBtn.addEventListener("click", () => setFull(!full));
+  const onKey = (e) => {
+    if (e.key !== "Escape" || !full) return;
+    const t = e.target;
+    if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.tagName === "SELECT")) return;
+    setFull(false);
+  };
+  const onResize = () => layoutFull();
+  document.addEventListener("keydown", onKey);
+  window.addEventListener("resize", onResize);
 
   // ---------- sessions ----------
   function renderSessionSelect() {
@@ -985,7 +1087,7 @@ export function setup(ctx) {
   function setCtxOpen(v) {
     ctxOpen = v;
     ctxView.classList.toggle("open", v);
-    log.style.display = v ? "none" : "";
+    log.style.display = v && !(full && fullWide) ? "none" : "";
     ctxBtn.classList.toggle("on", v);
     if (v) {
       pickScrollTop = null;
@@ -995,6 +1097,7 @@ export function setup(ctx) {
       requestPreview();
       renderContextView();
     }
+    if (full) updateSide();
   }
 
   ctxBtn.addEventListener("click", () => setCtxOpen(!ctxOpen));
@@ -1029,6 +1132,7 @@ export function setup(ctx) {
   settingsBtn.addEventListener("click", () => {
     const open = setPanel.classList.toggle("open");
     settingsBtn.classList.toggle("on", open);
+    if (full) updateSide();
   });
   modeSelect.addEventListener("change", () => {
     settings.mode = modeSelect.value;
@@ -1064,6 +1168,60 @@ export function setup(ctx) {
   resetBtn.addEventListener("click", () => {
     settings.systemPrompt = "";
     promptTa.value = defaultSystem;
+    saveSettings();
+  });
+
+  // ---------- assistant voice ----------
+  function updatePlaceholder() {
+    const dv = defaultVoices[settings.voice];
+    const name = dv ? dv.name : "Copilot";
+    input.placeholder =
+      settings.mode === "general" || !hasChat ? `Ask ${name} anything…` : `Ask ${name} about the roleplay…`;
+  }
+
+  function renderVoiceOptions() {
+    voiceSelect.replaceChildren();
+    const d = el("option", "", "Default");
+    d.value = "default";
+    voiceSelect.appendChild(d);
+    for (const id of Object.keys(defaultVoices)) {
+      const o = el("option", "", defaultVoices[id].name);
+      o.value = id;
+      voiceSelect.appendChild(o);
+    }
+  }
+
+  function syncVoiceUI() {
+    const v = settings.voice || "default";
+    const dv = defaultVoices[v];
+    voiceSelect.value = v;
+    voiceTa.style.display = dv ? "" : "none";
+    voiceReset.style.display = dv ? "" : "none";
+    if (dv) voiceTa.value = (settings.voiceTexts && settings.voiceTexts[v]) || dv.text;
+    updatePlaceholder();
+  }
+
+  voiceSelect.addEventListener("change", () => {
+    settings.voice = voiceSelect.value;
+    saveSettings();
+    syncVoiceUI();
+  });
+  voiceTa.addEventListener("change", () => {
+    const v = settings.voice;
+    const dv = defaultVoices[v];
+    if (!dv) return;
+    const t = voiceTa.value.trim();
+    settings.voiceTexts = { ...(settings.voiceTexts || {}) };
+    if (!t || t === dv.text.trim()) delete settings.voiceTexts[v];
+    else settings.voiceTexts[v] = t;
+    saveSettings();
+  });
+  voiceReset.addEventListener("click", () => {
+    const v = settings.voice;
+    if (!defaultVoices[v]) return;
+    settings.voiceTexts = { ...(settings.voiceTexts || {}) };
+    delete settings.voiceTexts[v];
+    voiceTa.value = defaultVoices[v].text;
     saveSettings();
   });
 
@@ -1689,7 +1847,10 @@ export function setup(ctx) {
             : p.chat
               ? "Chat: " + p.chat.name
               : "No active chat, using General";
-        input.placeholder = general ? "Ask anything…" : "Ask about the roleplay…";
+        hasChat = !!p.chat;
+        if (p.defaultVoices) defaultVoices = p.defaultVoices;
+        renderVoiceOptions();
+        syncVoiceUI();
 
         const composite = p.sessionKey + "|" + p.sessionId;
         if (composite !== currentKey) {
@@ -1773,6 +1934,9 @@ export function setup(ctx) {
   ctx.sendToBackend({ type: "init" });
 
   return () => {
+    document.removeEventListener("keydown", onKey);
+    window.removeEventListener("resize", onResize);
+    root.remove();
     if (raf) cancelAnimationFrame(raf);
     clearTimeout(delTimer);
     clearTimeout(previewTimer);
