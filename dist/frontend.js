@@ -20,6 +20,7 @@ const ICONS = {
   plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
   maximize: '<path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>',
   minimize: '<path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>',
+  forward: '<polygon points="13 19 22 12 13 5 13 19"/><polygon points="2 19 11 12 2 5 2 19"/>',
 };
 
 const STYLES = `
@@ -339,6 +340,32 @@ async function copyText(text) {
 const est = (s) => Math.ceil(String(s).length / 4);
 const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
 
+// Joins a continuation onto the message it continues
+function joinContinuation(base, add) {
+  if (!base) return add;
+  if (/^\s/.test(add) || /\s$/.test(base)) return base + add;
+  if (/[.!?…"”’)\]*_~]$/.test(base)) return base + " " + add;
+  return base + add;
+}
+
+// Free session title: the first few words of the first message
+function nameFromText(t) {
+  const words = String(t)
+    .replace(/[`*_#>~\[\]]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+  if (!words.length) return "";
+  let n = words.slice(0, 6).join(" ");
+  let cut = words.length > 6;
+  if (n.length > 40) {
+    n = n.slice(0, 40).replace(/\s+\S*$/, "") || n.slice(0, 40);
+    cut = true;
+  }
+  return n.charAt(0).toUpperCase() + n.slice(1) + (cut ? "…" : "");
+}
+
 // ---------- lorebook proposals (blocks Danny writes at the end of a reply) ----------
 const PROP_RE = /<(lorebook_entry|chat_edit)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
 
@@ -423,6 +450,8 @@ export function setup(ctx) {
   let ctxImgTokens = 0;
   let noteTimer = 0;
   let hasChat = false;
+  let contIdx = -1;
+  let contBase = "";
   let defaultVoices = {};
   let sessions = { active: null, list: [] };
   const openIds = new Set();
@@ -1690,6 +1719,7 @@ export function setup(ctx) {
       }));
       if (i === history.length - 1) {
         bar.appendChild(actBtn(ICONS.refresh, m.role === "assistant" ? "Regenerate" : "Retry", regen));
+        if (m.role === "assistant") bar.appendChild(actBtn(ICONS.forward, "Continue", continueMsg));
       }
     }
 
@@ -1738,7 +1768,7 @@ export function setup(ctx) {
   function paintStream() {
     raf = 0;
     if (!currentBubble) return;
-    const p = parseProposals(assistantText);
+    const p = parseProposals(contBase ? joinContinuation(contBase, assistantText) : assistantText);
     let t = p.text;
     const open = t.search(/<(lorebook_entry|chat_edit)\b/i);
     if (open >= 0) t = t.slice(0, open).trimEnd();
@@ -1747,24 +1777,62 @@ export function setup(ctx) {
     log.scrollTop = log.scrollHeight;
   }
 
-  function generate(text, prior) {
+  function generate(text, prior, cont) {
     sendKey = currentKey;
     assistantText = "";
+    contIdx = -1;
+    contBase = "";
+    currentBubble = null;
     reqId++;
     setBusy(true);
     renderHistory();
-    const wrap = el("div", "cp-wrap assistant");
-    currentBubble = el("div", "cp-msg assistant cp-md", "…");
-    wrap.appendChild(currentBubble);
-    log.appendChild(wrap);
+    if (cont && history.length && history[history.length - 1].role === "assistant") {
+      contIdx = history.length - 1;
+      contBase = history[contIdx].content;
+      const last = log.lastElementChild;
+      currentBubble = last ? last.querySelector(".cp-md") : null;
+    }
+    if (!currentBubble) {
+      const wrap = el("div", "cp-wrap assistant");
+      currentBubble = el("div", "cp-msg assistant cp-md", "…");
+      wrap.appendChild(currentBubble);
+      log.appendChild(wrap);
+    }
     log.scrollTop = log.scrollHeight;
     ctx.sendToBackend({ type: "send", reqId, text, history: prior.slice(-40) });
+  }
+
+  const CONTINUE_PROMPT =
+    "Continue exactly where your last message stopped. If it ended mid-word or mid-sentence, pick up right there; otherwise carry on naturally. Don't repeat anything and don't add any preamble or commentary, just the continuation.";
+
+  function continueMsg() {
+    if (busy || !history.length || history[history.length - 1].role !== "assistant") return;
+    generate(CONTINUE_PROMPT, history.slice(), true);
+  }
+
+  function autoNameSession(text) {
+    const cur = sessions.list.find((s) => s.id === sessions.active);
+    if (!cur || !/^Session \d+$/.test(cur.name)) return;
+    const name = nameFromText(text);
+    if (!name) return;
+    cur.name = name;
+    renderSessionSelect();
+    ctx.sendToBackend({ type: "session_rename", sid: cur.id, name });
   }
 
   function finish() {
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     const sameKey = sendKey === currentKey;
-    if (assistantText && sameKey) history.push({ role: "assistant", content: assistantText });
+    if (assistantText && sameKey) {
+      const target = contIdx >= 0 ? history[contIdx] : null;
+      if (target && target.role === "assistant") {
+        target.content = joinContinuation(contBase, assistantText);
+      } else {
+        history.push({ role: "assistant", content: assistantText });
+      }
+    }
+    contIdx = -1;
+    contBase = "";
     assistantText = "";
     currentBubble = null;
     setBusy(false);
@@ -1784,6 +1852,7 @@ export function setup(ctx) {
     input.value = "";
     input.style.height = "auto";
     if (ctxOpen) setCtxOpen(false);
+    if (history.length === 0) autoNameSession(text);
     const prior = history.slice();
     history.push({ role: "user", content: text });
     saveHistory();
