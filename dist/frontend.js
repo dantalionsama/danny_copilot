@@ -135,7 +135,7 @@ const STYLES = `
   .cp-prow input { accent-color:var(--cp-primary); flex:none; margin:2px 0 0; pointer-events:none; }
   .cp-prow.off .cp-ptext { opacity:0.5; }
   .cp-prow.start { outline:1px solid var(--cp-primary); }
-  .cp-ptag { flex:none; width:26px; padding-top:2px; font-size:10px; text-transform:uppercase; color:var(--cp-muted); }
+  .cp-ptag { flex:none; min-width:52px; white-space:nowrap; padding-top:2px; font-size:10px; text-transform:uppercase; color:var(--cp-muted); }
   .cp-ptext { flex:1; min-width:0; font-size:12px; line-height:1.35; word-break:break-word; overflow:hidden;
     display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
 
@@ -397,6 +397,7 @@ export function setup(ctx) {
   let rangeArmed = false;
   let rangeStart = null;
   let pickScrollTop = null;
+  let loreScrollTop = 0;
   let ridN = 0;
   const pendingCbs = new Map();
   let files = [];
@@ -817,6 +818,7 @@ export function setup(ctx) {
       head.appendChild(b);
     }
     box.appendChild(head);
+    const list = el("div", "cp-plist");
 
     for (const x of ctxLore) {
       const id = "lk:" + x.key;
@@ -855,8 +857,11 @@ export function setup(ctx) {
         pre.textContent = x.text;
         item.appendChild(pre);
       }
-      box.appendChild(item);
+      list.appendChild(item);
     }
+    list.addEventListener("scroll", () => { loreScrollTop = list.scrollTop; });
+    box.appendChild(list);
+    requestAnimationFrame(() => { list.scrollTop = loreScrollTop; });
     return box;
   }
 
@@ -912,7 +917,7 @@ export function setup(ctx) {
       const tag = x.role === "user" ? "you" : x.role === "assistant" ? "ai" : "sys";
       row.append(
         cb,
-        el("span", "cp-ptag", tag),
+        el("span", "cp-ptag", `${tag} #${x.i}`),
         el("span", "cp-ptext", x.preview || "(empty)"),
         el("span", "cp-dim", "~" + fmt(x.tokens)),
       );
@@ -984,6 +989,7 @@ export function setup(ctx) {
     ctxBtn.classList.toggle("on", v);
     if (v) {
       pickScrollTop = null;
+      loreScrollTop = 0;
       rangeArmed = false;
       rangeStart = null;
       requestPreview();
