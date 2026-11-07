@@ -177,7 +177,7 @@ const STYLES = `
     text-decoration:line-through; opacity:0.85; border-radius:3px; }
 
   .cp-side { display:none; flex-direction:column; gap:8px; min-height:0; overflow-y:auto; scrollbar-width:thin; }
-  .cp-root.cp-full { position:fixed; inset:0; z-index:2147483000; width:100vw; height:100vh; height:100dvh;
+  .cp-root.cp-full { position:fixed; inset:0; z-index:2147483000; width:auto; height:auto;
     padding:14px 18px; background:var(--lumiverse-bg, #0d0d11); overflow:hidden; }
   .cp-full .cp-top, .cp-full .cp-bottom { position:static; margin:0; padding:0; background:none;
     -webkit-backdrop-filter:none; backdrop-filter:none; }
