@@ -778,7 +778,7 @@ export function setup(ctx) {
       root.insertBefore(setPanel, chatLine);
       root.insertBefore(ctxView, bottomGroup);
     }
-    log.style.display = ctxOpen && !fullWide ? "none" : "";
+    syncLog();
     updateSide();
   }
 
@@ -805,7 +805,7 @@ export function setup(ctx) {
       tab.root.appendChild(root);
       root.insertBefore(setPanel, chatLine);
       root.insertBefore(ctxView, bottomGroup);
-      log.style.display = ctxOpen ? "none" : "";
+      syncLog();
     }
     fullBtn.innerHTML = svg(full ? ICONS.minimize : ICONS.maximize, 16);
     fullBtn.title = full ? "Exit fullscreen (Esc)" : "Fullscreen";
@@ -1111,10 +1111,14 @@ export function setup(ctx) {
     }
   }
 
+  function syncLog() {
+    const setOpen = setPanel.classList.contains("open");
+    log.style.display = (ctxOpen || setOpen) && !(full && fullWide) ? "none" : "";
+  }
+
   function setCtxOpen(v) {
     ctxOpen = v;
     ctxView.classList.toggle("open", v);
-    log.style.display = v && !(full && fullWide) ? "none" : "";
     ctxBtn.classList.toggle("on", v);
     if (v) {
       pickScrollTop = null;
@@ -1124,6 +1128,7 @@ export function setup(ctx) {
       requestPreview();
       renderContextView();
     }
+    syncLog();
     if (full) updateSide();
   }
 
@@ -1159,6 +1164,7 @@ export function setup(ctx) {
   settingsBtn.addEventListener("click", () => {
     const open = setPanel.classList.toggle("open");
     settingsBtn.classList.toggle("on", open);
+    syncLog();
     if (full) updateSide();
   });
   modeSelect.addEventListener("change", () => {
