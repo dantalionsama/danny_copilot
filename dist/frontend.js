@@ -178,21 +178,47 @@ const STYLES = `
   .cp-del { background:color-mix(in srgb, var(--lumiverse-danger, #e5484d) 28%, transparent);
     text-decoration:line-through; opacity:0.85; border-radius:3px; }
 
-  .cp-side { display:none; flex-direction:column; gap:8px; min-height:0; overflow-y:auto; scrollbar-width:thin; }
-  .cp-root.cp-full { position:fixed; inset:0; z-index:2147483000; width:auto; height:auto;
-    padding:14px 18px; background:var(--lumiverse-bg, #0d0d11); overflow:hidden; }
-  .cp-full .cp-top, .cp-full .cp-bottom { position:static; margin:0; padding:0; background:none;
+  .cp-side { display:none; flex-direction:column; gap:10px; min-height:0; overflow-y:auto; scrollbar-width:thin; }
+
+  /* ----- fullscreen ----- */
+  .cp-root.cp-full { position:fixed; inset:0; z-index:2147483000; width:auto; height:auto; padding:0; gap:0;
+    background:var(--lumiverse-bg, #0d0d11); overflow:hidden; font-size:14px; }
+  .cp-full .cp-top, .cp-full .cp-bottom { position:static; margin:0; background:none;
     -webkit-backdrop-filter:none; backdrop-filter:none; }
+  .cp-full > .cp-top, .cp-full > .cp-chatline, .cp-full > .cp-log, .cp-full > .cp-bottom {
+    box-sizing:border-box; width:100%; max-width:880px; padding-left:28px; padding-right:28px; }
+  .cp-full .cp-push { margin-left:auto; }
+  .cp-full .cp-toprow .cp-ctx { flex:0 1 260px; }
+  .cp-full > .cp-chatline { padding-top:4px; padding-bottom:8px; }
+  .cp-full .cp-log { gap:16px; padding-top:8px; padding-bottom:20px; }
+  .cp-full .cp-msg { padding:12px 16px; line-height:1.65; }
+  .cp-full .cp-wrap.user { max-width:78%; }
+  .cp-full .cp-foot { padding:0 4px; }
+  .cp-full .cp-inputbar { padding:8px; gap:6px; background:var(--cp-surface); border:1px solid var(--cp-border);
+    border-radius:22px; box-shadow:0 8px 28px rgba(0,0,0,0.22); transition:border-color 0.15s; }
+  .cp-full .cp-inputbar:focus-within { border-color:var(--cp-primary); }
+  .cp-full .cp-input { background:transparent; border:none; padding:9px 8px; }
+  .cp-full .cp-clip { background:transparent; border-color:transparent; }
+  .cp-full .cp-clip:hover { background:var(--cp-fill-hover); }
+
   .cp-full:not(.wide) > .cp-top, .cp-full:not(.wide) > .cp-chatline,
-  .cp-full:not(.wide) > .cp-log, .cp-full:not(.wide) > .cp-bottom { width:100%; max-width:900px; align-self:center; }
-  .cp-root.cp-full.wide { display:grid; grid-template-columns:minmax(0,1100px) minmax(340px,420px);
-    grid-template-rows:auto auto minmax(0,1fr) auto; column-gap:18px; row-gap:8px; justify-content:center; }
-  .cp-root.cp-full.wide.noside { grid-template-columns:minmax(0,1100px); }
-  .cp-full.wide > .cp-top { grid-column:1; grid-row:1; }
-  .cp-full.wide > .cp-chatline { grid-column:1; grid-row:2; }
-  .cp-full.wide > .cp-log { grid-column:1; grid-row:3; }
-  .cp-full.wide > .cp-bottom { grid-column:1; grid-row:4; }
-  .cp-full.wide > .cp-side { grid-column:2; grid-row:1 / 5; }
+  .cp-full:not(.wide) > .cp-log, .cp-full:not(.wide) > .cp-bottom { align-self:center; }
+  .cp-full:not(.wide) > .cp-top { padding-top:16px; }
+  .cp-full:not(.wide) > .cp-bottom { padding-bottom:18px; }
+  .cp-full:not(.wide) > .cp-set, .cp-full:not(.wide) > .cp-ctxview, .cp-full:not(.wide) > .cp-draftview {
+    box-sizing:border-box; width:calc(100% - 40px); max-width:840px; align-self:center; margin-top:8px; }
+
+  .cp-root.cp-full.wide { display:grid; grid-template-columns:minmax(0,1fr) minmax(360px,440px);
+    grid-template-rows:auto auto minmax(0,1fr) auto; }
+  .cp-root.cp-full.wide.noside { grid-template-columns:minmax(0,1fr); }
+  .cp-full.wide > .cp-top { grid-column:1; grid-row:1; justify-self:center; padding-top:22px;
+    display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px 10px; }
+  .cp-full.wide > .cp-top > .cp-toprow { grid-column:1 / -1; }
+  .cp-full.wide > .cp-chatline { grid-column:1; grid-row:2; justify-self:center; }
+  .cp-full.wide > .cp-log { grid-column:1; grid-row:3; justify-self:center; }
+  .cp-full.wide > .cp-bottom { grid-column:1; grid-row:4; justify-self:center; padding-bottom:24px; }
+  .cp-full.wide > .cp-side { grid-column:2; grid-row:1 / 5; padding:22px 20px 26px;
+    background:var(--cp-surface); border-left:1px solid var(--cp-border); }
   .cp-full.wide > .cp-side.show { display:flex; }
 
   .cp-draftview { flex:1; min-height:0; overflow-y:auto; display:none; flex-direction:column; gap:10px; scrollbar-width:thin; }
@@ -571,6 +597,8 @@ export function setup(ctx) {
   const settingsBtn = iconBtn(ICONS.sliders, "Settings");
   const fullBtn = iconBtn(ICONS.maximize, "Fullscreen");
   topRow.append(modeSelect, ctxWrap, ctxNum, settingsBtn, fullBtn);
+  topRow.classList.add("cp-toprow");
+  settingsBtn.classList.add("cp-push");
 
   // row 2: connection
   const connRow = el("div", "cp-row");
@@ -1048,6 +1076,7 @@ export function setup(ctx) {
     fullBtn.innerHTML = svg(full ? ICONS.minimize : ICONS.maximize, 16);
     fullBtn.title = full ? "Exit fullscreen (Esc)" : "Fullscreen";
     fullBtn.classList.toggle("on", full);
+    scrollSoon();
   }
 
   fullBtn.addEventListener("click", () => setFull(!full));
@@ -1060,6 +1089,52 @@ export function setup(ctx) {
   const onResize = () => layoutFull();
   document.addEventListener("keydown", onKey);
   window.addEventListener("resize", onResize);
+
+
+  // ---------- open at the bottom ----------
+  // Scrolls the log, and also the drawer when the drawer (not the log) is what scrolls.
+  function scrollToBottom() {
+    log.scrollTop = log.scrollHeight;
+    let p = root.parentElement;
+    while (p && p !== document.body && p !== document.documentElement) {
+      const oy = getComputedStyle(p).overflowY;
+      if ((oy === "auto" || oy === "scroll") && p.scrollHeight > p.clientHeight + 1) {
+        p.scrollTop = p.scrollHeight;
+        break;
+      }
+      p = p.parentElement;
+    }
+  }
+
+  function scrollSoon() {
+    requestAnimationFrame(() => {
+      scrollToBottom();
+      requestAnimationFrame(scrollToBottom);
+    });
+    setTimeout(scrollToBottom, 150);
+  }
+
+  // If Copilot isn't on screen yet (drawer closed), wait until it becomes visible, then jump to the bottom.
+  let pendingBottom = true;
+  const bottomObserver =
+    typeof IntersectionObserver === "function"
+      ? new IntersectionObserver((entries) => {
+          if (pendingBottom && entries.some((e) => e.isIntersecting)) {
+            pendingBottom = false;
+            scrollSoon();
+          }
+        })
+      : null;
+  if (bottomObserver) bottomObserver.observe(root);
+
+  function wantBottom() {
+    if (full || root.offsetParent !== null) {
+      pendingBottom = false;
+      scrollSoon();
+    } else {
+      pendingBottom = true;
+    }
+  }
 
   // ---------- sessions ----------
   function renderSessionSelect() {
@@ -2196,6 +2271,7 @@ export function setup(ctx) {
           currentSid = p.sessionId;
           history = Array.isArray(p.history) ? p.history : [];
           renderHistory();
+          wantBottom();
         }
         requestPreview();
         break;
@@ -2267,13 +2343,17 @@ export function setup(ctx) {
     ctx.sendToBackend({ type: "init" });
   });
 
-  tab.onActivate(() => ctx.sendToBackend({ type: "init" }));
+  tab.onActivate(() => {
+    ctx.sendToBackend({ type: "init" });
+    wantBottom();
+  });
   ctx.sendToBackend({ type: "init" });
 
   return () => {
     document.removeEventListener("keydown", onKey);
     window.removeEventListener("resize", onResize);
     root.remove();
+    if (bottomObserver) bottomObserver.disconnect();
     if (raf) cancelAnimationFrame(raf);
     clearTimeout(delTimer);
     clearTimeout(previewTimer);
