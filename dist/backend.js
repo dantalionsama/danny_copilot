@@ -48,6 +48,16 @@ Use everything the writer and you discussed in this conversation. Don't invent m
 
 const CARD_NSFW = `NSFW: add an <nsfw_{{char}}>...</nsfw_{{char}}> block at the end of the description only when the writer asks for one or their style notes say to. Only for characters who are clearly adults (18+); if the age isn't established, ask first. Follow the writer's own style notes and examples for this block, and don't add disclaimers or moralizing.`;
 
+const CARD_STYLE = `CARD STYLE (applies to every template)
+- Concrete over ornate: describe what the character visibly does, says and avoids, not abstract feelings or poetic summaries. No purple prose.
+- Keep lore tight: for known characters, don't restate canon the model already knows; only the setup, the deviations and what matters for this roleplay.
+- BEHAVIOR: one line per bullet, "When X -> concrete reaction".
+- VOICE: 3-5 short example lines (1-2 sentences each), each labeled by situation. No speeches.
+- FAILURE CONDITIONS: 3-5 short, specific "Never ..." rules.
+- If an NSFW block is requested: short plain labeled lines (for example Anatomy / Style & Kinks / Quirks). No headings, bold or flowery prose inside it.
+- Aim for a description of roughly 700-1000 tokens in total.
+If a style reference card is provided below, match its structure, level of detail, tone and formatting exactly, and never its content.`;
+
 const CARD_TEMPLATES = {
   oc: {
     name: "Character (OC)",
@@ -164,6 +174,7 @@ const DEFAULTS = {
   cardMaker: true,
   cardTemplate: "oc",
   cardNotes: "",
+  cardExamples: { oc: "", ip: "", rpg: "" },
   systemPrompt: "",
 };
 
@@ -257,6 +268,13 @@ function cleanSettings(s) {
     o.cardMaker = s.cardMaker !== false;
     if (["oc", "ip", "rpg"].includes(s.cardTemplate)) o.cardTemplate = s.cardTemplate;
     if (typeof s.cardNotes === "string") o.cardNotes = s.cardNotes.slice(0, 3000);
+    const exs = { oc: "", ip: "", rpg: "" };
+    if (s.cardExamples && typeof s.cardExamples === "object") {
+      for (const k of Object.keys(exs)) {
+        if (typeof s.cardExamples[k] === "string") exs[k] = s.cardExamples[k].slice(0, 100);
+      }
+    }
+    o.cardExamples = exs;
     // one-time move: an old custom "AO3 Danny" system prompt becomes the Danny voice
     if (typeof s.voice !== "string" && /\bAO3\b/i.test(o.systemPrompt)) {
       o.systemPrompt = "";
@@ -542,6 +560,19 @@ async function activeDraft(userId) {
   return getDraft(userId, key, sidx.active);
 }
 
+// ---------- example cards (style references for the card maker) ----------
+const exampleCache = new Map();
+async function getExampleCard(id, userId) {
+  const ck = `${uk(userId)}|${id}`;
+  const hit = exampleCache.get(ck);
+  if (hit && Date.now() - hit.at < 300000) return hit.val;
+  const c = await spindle.characters.get(String(id), userId);
+  const val = c ? { name: String(c.name || "Example"), description: clip(c.description, 12000) } : null;
+  if (exampleCache.size > 12) exampleCache.clear();
+  exampleCache.set(ck, { at: Date.now(), val });
+  return val;
+}
+
 // ---------- lorebook books and entries (for proposals) ----------
 function needWB() {
   if (!spindle.world_books) {
@@ -774,9 +805,24 @@ async function buildContext(userId, settings, opts = {}) {
       if (has || opts.cardIntent) {
         cardActive = true;
         const tpl = CARD_TEMPLATES[settings.cardTemplate] || CARD_TEMPLATES.oc;
-        let ct = `${CARD_RULES}\n\n${tpl.text}\n\n${CARD_NSFW}`;
+        let ct = `${CARD_RULES}\n\n${CARD_STYLE}\n\n${tpl.text}\n\n${CARD_NSFW}`;
         if (settings.cardNotes.trim()) ct += `\n\nThe writer's card style notes:\n${settings.cardNotes.trim()}`;
         sections.push({ id: "cardmaker", label: `Card maker (${tpl.name})`, text: ct });
+        const exId = (settings.cardExamples || {})[settings.cardTemplate] || "";
+        if (exId) {
+          try {
+            const ex = await getExampleCard(exId, userId);
+            if (ex && ex.description.trim()) {
+              sections.push({
+                id: "cardexample",
+                label: `Card example: ${ex.name}`,
+                text: `STYLE REFERENCE: "${ex.name}" is a finished card for this template. Match its structure, level of detail, tone and formatting exactly. Never copy its content.\n${ex.description}`,
+              });
+            }
+          } catch (e) {
+            spindle.log.warn("[Copilot] example card failed: " + e.message);
+          }
+        }
         if (has) {
           sections.push({
             id: "carddraft",
@@ -1499,6 +1545,27 @@ spindle.onFrontendMessage(async (payload, userId) => {
       break;
     }
 
+    case "card_list": {
+      const rid = payload.rid;
+      try {
+        const cards = [];
+        let offset = 0;
+        for (let guard = 0; guard < 40; guard++) {
+          const r = await spindle.characters.list({ limit: 100, offset, userId });
+          const data = (r && r.data) || [];
+          for (const c of data) cards.push({ id: String(c.id), name: String(c.name || "Unnamed") });
+          offset += data.length;
+          if (!data.length || (r && typeof r.total === "number" && offset >= r.total)) break;
+        }
+        cards.sort((x, y) => x.name.localeCompare(y.name));
+        spindle.sendToFrontend({ type: "card_list", rid, ok: true, cards }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] card_list failed: " + e.message);
+        spindle.sendToFrontend({ type: "card_list", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
     case "save_settings": {
       const s = cleanSettings(payload.settings);
       cache[uk(userId)] = s;
@@ -1537,15 +1604,19 @@ spindle.onFrontendMessage(async (payload, userId) => {
       try {
         const settings = await getSettings(userId);
         const text = String(payload.text || "");
-        const cardIntent = settings.cardMaker && CARD_INTENT_RE.test(text);
+        const cardForce = settings.cardMaker && payload.cardForce === true;
+        const cardIntent = settings.cardMaker && (cardForce || CARD_INTENT_RE.test(text));
+        const llmText = cardForce
+          ? `${text}\n\n(Write the card now: one short reply, then the complete card_draft block in the exact format from the card maker instructions.)`
+          : text;
         const { sections, images, cardActive } = await buildContext(userId, settings, { forSend: true, cardIntent });
 
         const past = cleanHistory(payload.history)
           .slice(cardActive ? -200 : -40)
           .map(({ role, content }) => ({ role, content }));
         const lastContent = images.length
-          ? [{ type: "text", text }, ...images.map((im) => ({ type: "image", data: im.data, mime_type: im.mime }))]
-          : text;
+          ? [{ type: "text", text: llmText }, ...images.map((im) => ({ type: "image", data: im.data, mime_type: im.mime }))]
+          : llmText;
 
         const messages = [
           { role: "system", content: sections.map((s) => s.text).join("\n\n") },

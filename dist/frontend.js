@@ -526,6 +526,8 @@ export function setup(ctx) {
   let draftOpen = false;
   let draftConfirm = false;
   let draftMsg = "";
+  let cardChoices = [];
+  let cardChoicesAt = 0;
   let defaultVoices = {};
   let sessions = { active: null, list: [] };
   const openIds = new Set();
@@ -545,6 +547,7 @@ export function setup(ctx) {
     cardMaker: true,
     cardTemplate: "oc",
     cardNotes: "",
+    cardExamples: { oc: "", ip: "", rpg: "" },
     systemPrompt: "",
   };
 
@@ -657,6 +660,11 @@ export function setup(ctx) {
     tplSelect.appendChild(o);
   }
   tplRow.append(el("span", "", "Card template"), tplSelect);
+  const exRow = el("label", "cp-check");
+  const exSelect = el("select", "cp-sel");
+  exSelect.style.width = "170px";
+  exSelect.title = "A finished card Danny copies the style of (structure, detail level, tone), never its content";
+  exRow.append(el("span", "", "Example card"), exSelect);
   const notesLabel = el("span", "cp-dim", "Card style notes (optional)");
   const notesTa = el("textarea");
   notesTa.style.height = "80px";
@@ -695,7 +703,7 @@ export function setup(ctx) {
   const promptTa = el("textarea");
   const resetBtn = el("button", "cp-btn", "Reset prompt");
   resetBtn.style.alignSelf = "flex-start";
-  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, propRow, editRow, mkRow, tplRow, notesLabel, notesTa, voiceRow, voiceTa, voiceReset, promptLabel, promptTa, resetBtn);
+  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, propRow, editRow, mkRow, tplRow, exRow, notesLabel, notesTa, voiceRow, voiceTa, voiceReset, promptLabel, promptTa, resetBtn);
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
@@ -859,6 +867,51 @@ export function setup(ctx) {
     input.style.height = Math.min(input.scrollHeight, 140) + "px";
   });
 
+  // ---------- example card + forced draft ----------
+  async function loadCardChoices(force) {
+    if (!force && cardChoices.length && Date.now() - cardChoicesAt < 60000) return;
+    const r = await rpc({ type: "card_list" });
+    if (r && r.ok) {
+      cardChoices = r.cards || [];
+      cardChoicesAt = Date.now();
+      renderExampleSelect();
+    }
+  }
+
+  function renderExampleSelect() {
+    exSelect.replaceChildren();
+    const none = el("option", "", "None");
+    none.value = "";
+    exSelect.appendChild(none);
+    for (const c of cardChoices) {
+      const o = el("option", "", c.name);
+      o.value = c.id;
+      exSelect.appendChild(o);
+    }
+    const cur = (settings.cardExamples || {})[settings.cardTemplate || "oc"] || "";
+    if (cur && !cardChoices.some((c) => c.id === cur)) {
+      const o = el("option", "", "(saved card)");
+      o.value = cur;
+      exSelect.appendChild(o);
+    }
+    exSelect.value = cur;
+  }
+
+  // Button path: always switches Danny into card mode, even when the message wouldn't have triggered it
+  function requestCardDraft() {
+    if (busy) return;
+    if (draftOpen && !(full && fullBoth)) setDraftOpen(false);
+    if (ctxOpen && !(full && fullBoth)) setCtxOpen(false);
+    const text = draftHasContent()
+      ? "Make the card again from everything we've discussed, updating the draft."
+      : "Make a card from everything we've discussed.";
+    if (history.length === 0) autoNameSession(text);
+    const prior = history.slice();
+    history.push({ role: "user", content: text });
+    saveHistory();
+    generate(text, prior, false, true);
+  }
+
   // ---------- card maker ----------
   const FIELD_LABELS = {
     name: "Name",
@@ -923,6 +976,9 @@ export function setup(ctx) {
       );
       hint.style.whiteSpace = "normal";
       draftView.appendChild(hint);
+      const make = textBtn("Draft a card from this chat", true, requestCardDraft);
+      make.style.alignSelf = "flex-start";
+      draftView.appendChild(make);
       return;
     }
 
@@ -1004,6 +1060,20 @@ export function setup(ctx) {
       area.appendChild(
         textBtn(created ? "Create another" : "Create card", true, () => { draftConfirm = "create"; renderDraftView(); }),
       );
+      area.appendChild(textBtn("Draft again from chat", false, requestCardDraft));
+      if (created) {
+        area.appendChild(
+          textBtn("Use as example", false, () => {
+            const tplId = settings.cardTemplate || "oc";
+            settings.cardExamples = { ...(settings.cardExamples || {}), [tplId]: created.id };
+            saveSettings();
+            renderExampleSelect();
+            draftMsg = `“${created.name}” is now Danny's style example for this template.`;
+            renderDraftView();
+            loadCardChoices(true);
+          }),
+        );
+      }
       area.appendChild(textBtn("Clear draft", false, () => { draftConfirm = "clear"; renderDraftView(); }));
       draftView.appendChild(area);
     }
@@ -1499,6 +1569,7 @@ export function setup(ctx) {
     editCb.checked = settings.chatEdits !== false;
     mkCb.checked = settings.cardMaker !== false;
     tplSelect.value = settings.cardTemplate || "oc";
+    renderExampleSelect();
     notesTa.value = settings.cardNotes || "";
     updateCardBtn();
   }
@@ -1512,6 +1583,7 @@ export function setup(ctx) {
 
   settingsBtn.addEventListener("click", () => {
     const open = setPanel.classList.toggle("open");
+    if (open) loadCardChoices(false);
     settingsBtn.classList.toggle("on", open);
     syncLog();
     if (full) updateSide();
@@ -1537,7 +1609,11 @@ export function setup(ctx) {
   propCb.addEventListener("change", () => { settings.proposals = propCb.checked; saveSettings(); });
   editCb.addEventListener("change", () => { settings.chatEdits = editCb.checked; saveSettings(); });
   mkCb.addEventListener("change", () => { settings.cardMaker = mkCb.checked; saveSettings(); updateCardBtn(); });
-  tplSelect.addEventListener("change", () => { settings.cardTemplate = tplSelect.value; saveSettings(); });
+  tplSelect.addEventListener("change", () => { settings.cardTemplate = tplSelect.value; saveSettings(); renderExampleSelect(); });
+  exSelect.addEventListener("change", () => {
+    settings.cardExamples = { ...(settings.cardExamples || {}), [settings.cardTemplate || "oc"]: exSelect.value };
+    saveSettings();
+  });
   notesTa.addEventListener("change", () => { settings.cardNotes = notesTa.value.trim(); saveSettings(); });
   loreCb.addEventListener("change", () => { settings.includeLore = loreCb.checked; saveSettings(); });
   budgetNum.addEventListener("change", () => {
@@ -2136,7 +2212,7 @@ export function setup(ctx) {
     log.scrollTop = log.scrollHeight;
   }
 
-  function generate(text, prior, cont) {
+  function generate(text, prior, cont, cardForce) {
     sendKey = currentKey;
     assistantText = "";
     contIdx = -1;
@@ -2158,7 +2234,7 @@ export function setup(ctx) {
       log.appendChild(wrap);
     }
     log.scrollTop = log.scrollHeight;
-    ctx.sendToBackend({ type: "send", reqId, text, history: prior.slice(-200) });
+    ctx.sendToBackend({ type: "send", reqId, text, history: prior.slice(-200), cardForce: !!cardForce });
   }
 
   const CONTINUE_PROMPT =
@@ -2326,7 +2402,8 @@ export function setup(ctx) {
       case "chat_applied":
       case "chat_undone":
       case "card_created":
-      case "card_undone": {
+      case "card_undone":
+      case "card_list": {
         const cb = pendingCbs.get(p.rid);
         if (cb) {
           pendingCbs.delete(p.rid);
