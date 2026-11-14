@@ -21,6 +21,98 @@ const VOICE_NOTE =
   "\n\nYour voice applies to your normal replies only. Anything you write inside lorebook entries or chat edits must be clean, neutral prose that fits the roleplay, never in your voice.";
 const isVoice = (v) => v === "default" || Object.prototype.hasOwnProperty.call(DEFAULT_VOICES, v);
 
+const CARD_FIELDS = ["name", "tags", "creator_notes", "scenario", "first_message", "description", "alternate_greetings"];
+const CARD_INTENT_RE = /\b(make|create|write|draft|build|generate|turn|compile)\b[^\n]{0,80}\bcard\b/i;
+
+const CARD_RULES = `CARD MAKER
+When the writer asks you to make a character card or to revise the current draft, write your normal short reply, then add the card as ONE block in exactly this format. Include only the fields you are writing or changing (a partial block updates just those fields of the current draft):
+
+<card_draft>
+@@name
+Card name
+@@tags
+tag one, tag two
+@@creator_notes
+A short note about the card. Not sent to the AI.
+@@scenario
+A short premise, or leave this field out.
+@@first_message
+The opening message of the roleplay, written for {{user}} to reply to. Never speak or act for {{user}}.
+@@description
+The main card text, following the template below.
+@@alternate_greetings
+Optional extra openers, separated by a line containing only -----
+</card_draft>
+
+Use everything the writer and you discussed in this conversation. Don't invent major facts the writer didn't establish: if something important is missing (like age), ask or leave a [bracketed slot]. The writer reviews, edits and creates the card in the app, so don't explain the format or mention creating it.`;
+
+const CARD_NSFW = `NSFW: add an <nsfw_{{char}}>...</nsfw_{{char}}> block at the end of the description only when the writer asks for one or their style notes say to. Only for characters who are clearly adults (18+); if the age isn't established, ask first. Follow the writer's own style notes and examples for this block, and don't add disclaimers or moralizing.`;
+
+const CARD_TEMPLATES = {
+  oc: {
+    name: "Character (OC)",
+    text: `TEMPLATE: Character (OC). Fill @@description with this structure (replace the descriptions with concrete lines, not adjective piles; use {{char}} in the wrapper tags):
+<{{char}}>
+# CORE
+Name / Aliases / Age / Nationality or species / Occupation / Residence / Goal
+# APPEARANCE
+2-4 sentences, distinctive and must-stay-consistent features only
+# BACKSTORY
+5-8 short bullets, beats not dates
+# PERSONALITY
+Core: a short paragraph including the contradiction
+Triggers / Fears:
+Behavior (critical): 6-8 bullets, trigger -> response
+Conduct by tier: {{user}} / familiar people / strangers / authority and enemies
+# ATTACHMENT
+Emotional pacing, physical and consent rules, emotional needs
+# VOICE
+Style and tics, then 4-6 example lines labeled by situation (a guide to tone, not to copy)
+# HABITS
+Optional: 3-5 distinctive ones
+# FAILURE CONDITIONS
+"Portraying {{char}} wrong if they..." 4-6 bullets
+</{{char}}>
+Also write @@first_message and, if needed, a brief @@scenario.`,
+  },
+  ip: {
+    name: "Known character (IP)",
+    text: `TEMPLATE: Known character (IP). The model already knows canon, so keep @@description lean:
+<{{char}}>
+# CANON BASELINE
+Which version, timeline or arc this is, plus only the deviations from canon
+# APPEARANCE
+1-2 sentences, only what differs or must stay consistent
+# DYNAMIC WITH {{user}}
+Who they are to each other, and the current state of the relationship
+# BEHAVIOR (critical)
+4-6 bullets, trigger -> response
+# VOICE
+3-4 example lines labeled by situation
+# FAILURE CONDITIONS
+3-4 bullets
+</{{char}}>
+Also write @@first_message and, if needed, a brief @@scenario.`,
+  },
+  rpg: {
+    name: "Scenario / RPG",
+    text: `TEMPLATE: Scenario / RPG. {{char}} is a narrator, not a single character. Fill @@description with:
+# ROLE
+The AI narrates the world and portrays every character except {{user}}.
+# CORE RULES
+Third-person narration; never describe or decide {{user}}'s actions, words or feelings; tone; pacing; content boundaries.
+# WORLD
+Setting, factions and the rules of the world: concise and concrete.
+# SYSTEMS
+Optional: scene header format, time tracking, consequences, relationship rules.
+# CAST
+One line per character: Name (age, species or role): personality hook; key relationships.
+# REMINDERS
+3-5 short lines restating the most important rules.
+Write @@scenario as the starting situation and @@first_message as the opening scene.`,
+  },
+};
+
 const LENGTH_RULES = {
   auto: "",
   short: "Keep replies short: usually 2-6 sentences, under 150 words. No headers or long lists unless the writer asks for more detail.",
@@ -69,6 +161,9 @@ const DEFAULTS = {
   chatEdits: true,
   voice: "default",
   voiceTexts: {},
+  cardMaker: true,
+  cardTemplate: "oc",
+  cardNotes: "",
   systemPrompt: "",
 };
 
@@ -159,6 +254,9 @@ function cleanSettings(s) {
       }
     }
     o.voiceTexts = vt;
+    o.cardMaker = s.cardMaker !== false;
+    if (["oc", "ip", "rpg"].includes(s.cardTemplate)) o.cardTemplate = s.cardTemplate;
+    if (typeof s.cardNotes === "string") o.cardNotes = s.cardNotes.slice(0, 3000);
     // one-time move: an old custom "AO3 Danny" system prompt becomes the Danny voice
     if (typeof s.voice !== "string" && /\bAO3\b/i.test(o.systemPrompt)) {
       o.systemPrompt = "";
@@ -250,6 +348,7 @@ async function sendInit(userId) {
   const sessions = await getSessions(key, userId);
   const history = await loadHistory(sessPath(key, sessions.active), userId);
   const shelf = await getShelf(userId, key, sessions.active);
+  const dr = await getDraft(userId, key, sessions.active);
   spindle.sendToFrontend({
     type: "init",
     connections: connections.map((c) => ({
@@ -264,6 +363,7 @@ async function sendInit(userId) {
     sessions,
     history,
     files: lightFiles(shelf.items),
+    draft: lightDraft(dr),
     settings,
     defaultSystem: DEFAULT_SYSTEM,
     defaultVoices: DEFAULT_VOICES,
@@ -385,6 +485,61 @@ function lightFiles(items) {
     thumb: x.kind === "image" ? x.thumb : undefined,
     truncated: x.truncated || undefined,
   }));
+}
+
+// ---------- card draft (one per session) ----------
+const draftCache = new Map();
+const draftPath = (key, sid) => `copilot_draft_${san(key)}_${san(sid)}.json`;
+
+function emptyDraft() {
+  const fields = {};
+  for (const k of CARD_FIELDS) fields[k] = "";
+  return { fields, created: null };
+}
+
+function cleanDraft(raw) {
+  const d = emptyDraft();
+  const f = raw && raw.fields && typeof raw.fields === "object" ? raw.fields : {};
+  for (const k of CARD_FIELDS) {
+    if (typeof f[k] === "string") d.fields[k] = f[k].slice(0, k === "name" ? 200 : 40000);
+  }
+  const c = raw && raw.created;
+  if (c && typeof c.id === "string") d.created = { id: c.id.slice(0, 100), name: clip(c.name, 200) };
+  return d;
+}
+
+async function getDraft(userId, key, sid) {
+  const ck = `${uk(userId)}|${key}|${sid}`;
+  if (draftCache.has(ck)) return draftCache.get(ck);
+  let raw = {};
+  try {
+    raw = await spindle.userStorage.getJson(draftPath(key, sid), { fallback: {}, userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] load draft failed: " + e.message);
+  }
+  const d = { key, sid, ...cleanDraft(raw) };
+  if (draftCache.size > 12) draftCache.clear();
+  draftCache.set(ck, d);
+  return d;
+}
+
+async function saveDraft(userId, d) {
+  try {
+    await spindle.userStorage.setJson(draftPath(d.key, d.sid), { fields: d.fields, created: d.created }, { userId });
+  } catch (e) {
+    spindle.log.warn("[Copilot] save draft failed: " + e.message);
+  }
+}
+
+const draftHas = (d) => CARD_FIELDS.some((k) => d.fields[k].trim());
+const lightDraft = (d) => ({ fields: d.fields, created: d.created });
+const draftText = (d) =>
+  CARD_FIELDS.filter((k) => d.fields[k].trim()).map((k) => `@@${k}\n${d.fields[k].trim()}`).join("\n");
+
+async function activeDraft(userId) {
+  const { key } = await resolveKey(userId);
+  const sidx = await getSessions(key, userId);
+  return getDraft(userId, key, sidx.active);
 }
 
 // ---------- lorebook books and entries (for proposals) ----------
@@ -608,6 +763,33 @@ async function buildContext(userId, settings, opts = {}) {
     });
   }
 
+  // card maker: instructions when the writer asks for a card or a draft exists, plus the current draft
+  let cardActive = false;
+  if (settings.cardMaker) {
+    try {
+      const dkey = useChat ? active.id : "general";
+      const dsx = await getSessions(dkey, userId);
+      const dr = await getDraft(userId, dkey, dsx.active);
+      const has = draftHas(dr);
+      if (has || opts.cardIntent) {
+        cardActive = true;
+        const tpl = CARD_TEMPLATES[settings.cardTemplate] || CARD_TEMPLATES.oc;
+        let ct = `${CARD_RULES}\n\n${tpl.text}\n\n${CARD_NSFW}`;
+        if (settings.cardNotes.trim()) ct += `\n\nThe writer's card style notes:\n${settings.cardNotes.trim()}`;
+        sections.push({ id: "cardmaker", label: `Card maker (${tpl.name})`, text: ct });
+        if (has) {
+          sections.push({
+            id: "carddraft",
+            label: "Card draft (current)",
+            text: `CURRENT CARD DRAFT. Update it by writing a card_draft block with only the fields you change.\n${draftText(dr)}`,
+          });
+        }
+      }
+    } catch (e) {
+      spindle.log.warn("[Copilot] card maker failed: " + e.message);
+    }
+  }
+
   // attachments: text files go into the system message, images ride on the last user message
   let images = [];
   let imgTokensTotal = 0;
@@ -754,7 +936,7 @@ async function buildContext(userId, settings, opts = {}) {
     text: x.text,
   }));
 
-  return { sections, notes, useChat, lore, msgs: msgsInfo, images, imgTokens: imgTokensTotal };
+  return { sections, notes, useChat, lore, msgs: msgsInfo, images, imgTokens: imgTokensTotal, cardActive };
 }
 
 async function sendPreview(userId) {
@@ -1214,6 +1396,109 @@ spindle.onFrontendMessage(async (payload, userId) => {
       break;
     }
 
+    case "draft_merge": {
+      try {
+        const d = await activeDraft(userId);
+        const src = payload.fields && typeof payload.fields === "object" ? payload.fields : {};
+        for (const k of CARD_FIELDS) {
+          if (typeof src[k] === "string" && src[k].trim()) {
+            d.fields[k] = src[k].trim().slice(0, k === "name" ? 200 : 40000);
+          }
+        }
+        await saveDraft(userId, d);
+        spindle.sendToFrontend({ type: "draft", draft: lightDraft(d) }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] draft_merge failed: " + e.message);
+      }
+      break;
+    }
+
+    case "draft_set": {
+      try {
+        const field = String(payload.field || "");
+        if (!CARD_FIELDS.includes(field)) break;
+        const d = await activeDraft(userId);
+        d.fields[field] = String(payload.value || "").slice(0, field === "name" ? 200 : 40000);
+        await saveDraft(userId, d);
+        spindle.sendToFrontend({ type: "draft", draft: lightDraft(d), quiet: true }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] draft_set failed: " + e.message);
+      }
+      break;
+    }
+
+    case "draft_clear": {
+      try {
+        const d = await activeDraft(userId);
+        d.fields = emptyDraft().fields;
+        d.created = null;
+        await saveDraft(userId, d);
+        spindle.sendToFrontend({ type: "draft", draft: lightDraft(d) }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] draft_clear failed: " + e.message);
+      }
+      break;
+    }
+
+    case "card_create": {
+      const rid = payload.rid;
+      try {
+        const d = await activeDraft(userId);
+        const f = d.fields;
+        const name = f.name.trim();
+        if (!name) throw new Error("The card needs a name.");
+        if (!f.description.trim() && !f.scenario.trim()) throw new Error("The card has no description yet.");
+        const tags = [
+          ...new Set([...f.tags.split(",").map((t) => t.trim()).filter(Boolean).slice(0, 30), "danny-copilot"]),
+        ];
+        const alts = f.alternate_greetings
+          .split(/\n\s*-{3,}\s*\n/)
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .slice(0, 10);
+        const c = await spindle.characters.create({
+          name,
+          description: f.description,
+          scenario: f.scenario,
+          first_mes: f.first_message,
+          creator_notes: f.creator_notes,
+          tags,
+          alternate_greetings: alts,
+        }, userId);
+        d.created = { id: String(c.id), name };
+        await saveDraft(userId, d);
+        spindle.sendToFrontend({ type: "card_created", rid, ok: true, id: String(c.id), name }, userId);
+        spindle.sendToFrontend({ type: "draft", draft: lightDraft(d) }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] card_create failed: " + e.message);
+        spindle.sendToFrontend({ type: "card_created", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
+    case "card_undo": {
+      const rid = payload.rid;
+      try {
+        const d = await activeDraft(userId);
+        if (!d.created) throw new Error("There's no created card to undo.");
+        const c = await spindle.characters.get(d.created.id, userId);
+        if (c) {
+          if (!(Array.isArray(c.tags) && c.tags.includes("danny-copilot"))) {
+            throw new Error("That card no longer has the danny-copilot tag, so I won't delete it.");
+          }
+          await spindle.characters.delete(d.created.id, userId);
+        }
+        d.created = null;
+        await saveDraft(userId, d);
+        spindle.sendToFrontend({ type: "card_undone", rid, ok: true }, userId);
+        spindle.sendToFrontend({ type: "draft", draft: lightDraft(d) }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] card_undo failed: " + e.message);
+        spindle.sendToFrontend({ type: "card_undone", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
     case "save_settings": {
       const s = cleanSettings(payload.settings);
       cache[uk(userId)] = s;
@@ -1251,13 +1536,13 @@ spindle.onFrontendMessage(async (payload, userId) => {
 
       try {
         const settings = await getSettings(userId);
-        const { sections, images } = await buildContext(userId, settings, { forSend: true });
+        const text = String(payload.text || "");
+        const cardIntent = settings.cardMaker && CARD_INTENT_RE.test(text);
+        const { sections, images, cardActive } = await buildContext(userId, settings, { forSend: true, cardIntent });
 
         const past = cleanHistory(payload.history)
-          .slice(-40)
+          .slice(cardActive ? -200 : -40)
           .map(({ role, content }) => ({ role, content }));
-
-        const text = String(payload.text || "");
         const lastContent = images.length
           ? [{ type: "text", text }, ...images.map((im) => ({ type: "image", data: im.data, mime_type: im.mime }))]
           : text;

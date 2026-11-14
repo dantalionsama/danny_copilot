@@ -21,6 +21,7 @@ const ICONS = {
   maximize: '<path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>',
   minimize: '<path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>',
   forward: '<polygon points="13 19 22 12 13 5 13 19"/><polygon points="2 19 11 12 2 5 2 19"/>',
+  idcard: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M6 17c.5-1.6 1.7-2.5 3-2.5s2.5.9 3 2.5"/><line x1="15" y1="9" x2="18" y2="9"/><line x1="15" y1="13" x2="18" y2="13"/>',
 };
 
 const STYLES = `
@@ -193,6 +194,13 @@ const STYLES = `
   .cp-full.wide > .cp-bottom { grid-column:1; grid-row:4; }
   .cp-full.wide > .cp-side { grid-column:2; grid-row:1 / 5; }
   .cp-full.wide > .cp-side.show { display:flex; }
+
+  .cp-draftview { flex:1; min-height:0; overflow-y:auto; display:none; flex-direction:column; gap:10px; scrollbar-width:thin; }
+  .cp-draftview.open { display:flex; }
+  .cp-fblk { display:flex; flex-direction:column; gap:4px; }
+  .cp-fhead { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:11px;
+    text-transform:uppercase; letter-spacing:0.04em; color:var(--cp-muted); }
+  .cp-badge { display:inline-block; width:7px; height:7px; margin-left:2px; border-radius:50%; background:var(--cp-primary); }
 
   .cp-inputbar { display:flex; align-items:flex-end; gap:8px; }
   .cp-input { flex:1; min-width:0; resize:none; min-height:38px; max-height:140px; padding:9px 14px; line-height:1.4;
@@ -367,16 +375,48 @@ function nameFromText(t) {
 }
 
 // ---------- lorebook proposals (blocks Danny writes at the end of a reply) ----------
-const PROP_RE = /<(lorebook_entry|chat_edit)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
+const PROP_RE = /<(lorebook_entry|chat_edit|card_draft)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
+const DRAFT_FIELDS = ["name", "tags", "creator_notes", "scenario", "first_message", "description", "alternate_greetings"];
+
+function parseDraftBody(body) {
+  const fields = {};
+  let cur = null;
+  let buf = [];
+  const flush = () => {
+    if (cur && !fields[cur]) {
+      const v = buf.join("\n").trim();
+      if (v) fields[cur] = v;
+    }
+    buf = [];
+  };
+  for (const line of body.replace(/\r/g, "").split("\n")) {
+    const m = line.match(/^@@\s*([a-z_]+)\s*$/i);
+    if (m && DRAFT_FIELDS.includes(m[1].toLowerCase())) {
+      flush();
+      cur = m[1].toLowerCase();
+      continue;
+    }
+    if (cur) buf.push(line);
+  }
+  flush();
+  return fields;
+}
 
 function parseProposals(text) {
   const blocks = [];
   const src = String(text).replace(
-    /```[a-z]*\s*(<(?:lorebook_entry|chat_edit)\b[\s\S]*?<\/(?:lorebook_entry|chat_edit)>)\s*```/gi,
+    /```[a-z]*\s*(<(?:lorebook_entry|chat_edit|card_draft)\b[\s\S]*?<\/(?:lorebook_entry|chat_edit|card_draft)>)\s*```/gi,
     "$1",
   );
   const clean = src.replace(PROP_RE, (whole, tagName, attrs, body) => {
-    const kind = tagName.toLowerCase() === "chat_edit" ? "chat" : "lore";
+    const tag = tagName.toLowerCase();
+    if (tag === "card_draft") {
+      const fields = parseDraftBody(body);
+      if (!Object.keys(fields).length) return whole;
+      blocks.push({ kind: "draft", fields });
+      return "";
+    }
+    const kind = tag === "chat_edit" ? "chat" : "lore";
     const b = { kind, action: "create", name: "", keys: [], update: "", note: "", message: -1, content: "" };
     if (kind === "lore") {
       b.action = /action\s*=\s*["']?update/i.test(attrs) ? "update" : "create";
@@ -452,6 +492,10 @@ export function setup(ctx) {
   let hasChat = false;
   let contIdx = -1;
   let contBase = "";
+  let draft = null;
+  let draftOpen = false;
+  let draftConfirm = false;
+  let draftMsg = "";
   let defaultVoices = {};
   let sessions = { active: null, list: [] };
   const openIds = new Set();
@@ -468,6 +512,9 @@ export function setup(ctx) {
     chatEdits: true,
     voice: "default",
     voiceTexts: {},
+    cardMaker: true,
+    cardTemplate: "oc",
+    cardNotes: "",
     systemPrompt: "",
   };
 
@@ -565,6 +612,23 @@ export function setup(ctx) {
   const editCb = el("input");
   editCb.type = "checkbox";
   editRow.append(editCb, el("span", "", "Allow chat edit proposals"));
+  const mkRow = el("label", "cp-check");
+  const mkCb = el("input");
+  mkCb.type = "checkbox";
+  mkRow.append(mkCb, el("span", "", "Allow card drafts"));
+  const tplRow = el("label", "cp-check");
+  const tplSelect = el("select", "cp-sel");
+  tplSelect.style.width = "170px";
+  for (const [v, t] of [["oc", "Character (OC)"], ["ip", "Known character (IP)"], ["rpg", "Scenario / RPG"]]) {
+    const o = el("option", "", t);
+    o.value = v;
+    tplSelect.appendChild(o);
+  }
+  tplRow.append(el("span", "", "Card template"), tplSelect);
+  const notesLabel = el("span", "cp-dim", "Card style notes (optional)");
+  const notesTa = el("textarea");
+  notesTa.style.height = "80px";
+  notesTa.placeholder = "e.g. third person, my usual layout, how to handle NSFW blocks…";
   const voiceRow = el("label", "cp-check");
   const voiceSelect = el("select", "cp-sel");
   voiceSelect.style.width = "150px";
@@ -599,7 +663,7 @@ export function setup(ctx) {
   const promptTa = el("textarea");
   const resetBtn = el("button", "cp-btn", "Reset prompt");
   resetBtn.style.alignSelf = "flex-start";
-  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, propRow, editRow, voiceRow, voiceTa, voiceReset, promptLabel, promptTa, resetBtn);
+  setPanel.append(cardRow, personaRow, loreRow, budgetRow, lenRow, propRow, editRow, mkRow, tplRow, notesLabel, notesTa, voiceRow, voiceTa, voiceReset, promptLabel, promptTa, resetBtn);
 
   const chatLine = el("div", "cp-dim", "No active chat");
   const log = el("div", "cp-log");
@@ -611,7 +675,11 @@ export function setup(ctx) {
   ctxBtn.innerHTML = svg(ICONS.layers, 14) + "<span>Context</span>";
   ctxBtn.title = "See exactly what gets sent to the model";
   const readout = el("span", "cp-readout", "");
-  foot.append(ctxBtn, readout);
+  const cardBtn = el("button", "cp-btn icon");
+  cardBtn.title = "Character card draft";
+  const footL = el("div", "cp-row");
+  footL.append(ctxBtn, cardBtn);
+  foot.append(footL, readout);
 
   // input
   const inputBar = el("div", "cp-inputbar");
@@ -749,7 +817,8 @@ export function setup(ctx) {
   bottomGroup.append(foot, chipBar, inputBar);
   chatLine.classList.add("cp-chatline");
   const side = el("div", "cp-side");
-  root.append(topGroup, setPanel, chatLine, log, ctxView, bottomGroup, side);
+  const draftView = el("div", "cp-draftview");
+  root.append(topGroup, setPanel, chatLine, log, ctxView, draftView, bottomGroup, side);
   tab.root.appendChild(root);
 
   input.addEventListener("input", () => {
@@ -757,13 +826,180 @@ export function setup(ctx) {
     input.style.height = Math.min(input.scrollHeight, 140) + "px";
   });
 
+  // ---------- card maker ----------
+  const FIELD_LABELS = {
+    name: "Name",
+    tags: "Tags (comma separated)",
+    description: "Description (main card text)",
+    scenario: "Scenario",
+    first_message: "First message",
+    alternate_greetings: "Alternate greetings (separate with a line of -----)",
+    creator_notes: "Creator notes (not sent to the AI)",
+  };
+  const FIELD_ORDER = ["name", "tags", "description", "scenario", "first_message", "alternate_greetings", "creator_notes"];
+
+  function draftHasContent() {
+    return !!draft && Object.values(draft.fields || {}).some((v) => String(v).trim());
+  }
+
+  function updateCardBtn() {
+    cardBtn.innerHTML =
+      svg(ICONS.idcard, 14) + "<span>Card</span>" + (draftHasContent() ? '<i class="cp-badge"></i>' : "");
+    cardBtn.classList.toggle("on", draftOpen);
+    cardBtn.style.display = settings.cardMaker === false ? "none" : "";
+  }
+
+  function buildDraftChip(block) {
+    const card = el("div", "cp-card");
+    card.appendChild(el("div", "cp-card-head", "Card draft updated"));
+    card.appendChild(el("div", "cp-card-keys", Object.keys(block.fields).join(", ")));
+    const row = el("div", "cp-card-actions");
+    row.appendChild(textBtn("Open draft", true, () => setDraftOpen(true)));
+    card.appendChild(row);
+    return card;
+  }
+
+  function renderDraftView() {
+    draftView.replaceChildren();
+    const f = (draft && draft.fields) || {};
+    const created = draft && draft.created;
+
+    const head = el("div", "cp-row");
+    const tpl = el("select", "cp-sel");
+    tpl.style.width = "180px";
+    tpl.title = "Template Danny follows when drafting";
+    for (const [v, t] of [["oc", "Character (OC)"], ["ip", "Known character (IP)"], ["rpg", "Scenario / RPG"]]) {
+      const o = el("option", "", t);
+      o.value = v;
+      tpl.appendChild(o);
+    }
+    tpl.value = settings.cardTemplate || "oc";
+    tpl.addEventListener("change", () => {
+      settings.cardTemplate = tpl.value;
+      saveSettings();
+      syncSettingsUI();
+    });
+    head.append(el("span", "cp-sec-name", "Card draft"), tpl);
+    draftView.appendChild(head);
+
+    if (!draftHasContent()) {
+      const hint = el(
+        "div",
+        "cp-dim",
+        "No draft yet. Chat about your character, then ask Danny to “make a card”. Her draft appears here so you can edit it and create the card.",
+      );
+      hint.style.whiteSpace = "normal";
+      draftView.appendChild(hint);
+      return;
+    }
+
+    const perm = est(f.description || "") + est(f.scenario || "");
+    let total = 0;
+    for (const k of FIELD_ORDER) total += est(f[k] || "");
+    const sum = el(
+      "div",
+      "cp-dim",
+      `~${fmt(total)} tokens in all · ~${fmt(perm)} sent with every message (description + scenario)`,
+    );
+    sum.style.whiteSpace = "normal";
+    draftView.appendChild(sum);
+
+    for (const k of FIELD_ORDER) {
+      const blk = el("div", "cp-fblk");
+      const tk = el("span", "", "~" + fmt(est(f[k] || "")));
+      const hd = el("div", "cp-fhead");
+      hd.append(el("span", "", FIELD_LABELS[k]), tk);
+      const single = k === "name" || k === "tags";
+      const inp = single ? el("input", "cp-field") : el("textarea", "cp-edit");
+      if (single) inp.style.flex = "none";
+      else inp.style.minHeight = k === "description" ? "260px" : k === "first_message" ? "160px" : "80px";
+      inp.value = f[k] || "";
+      inp.addEventListener("input", () => { tk.textContent = "~" + fmt(est(inp.value)); });
+      inp.addEventListener("change", () => ctx.sendToBackend({ type: "draft_set", field: k, value: inp.value }));
+      blk.append(hd, inp);
+      draftView.appendChild(blk);
+    }
+
+    if (draftMsg) {
+      const m = el("div", "cp-dim", draftMsg);
+      m.style.whiteSpace = "normal";
+      draftView.appendChild(m);
+    }
+
+    if (draftConfirm) {
+      const box = el("div", "cp-confirm");
+      const text =
+        draftConfirm === "create"
+          ? `This will create a new character card “${(f.name || "").trim() || "Untitled"}” in your library, tagged danny-copilot.`
+          : draftConfirm === "undo"
+            ? `This deletes “${created ? created.name : "the card"}” from your library, only while it still has the danny-copilot tag. Any chats using it would lose their card.`
+            : "Clear the whole draft? This can't be undone.";
+      box.appendChild(el("div", "", text));
+      const row = el("div", "cp-card-actions");
+      const cancel = textBtn("Cancel", false, () => { draftConfirm = false; renderDraftView(); });
+      const label = draftConfirm === "create" ? "Create card" : draftConfirm === "undo" ? "Delete card" : "Clear draft";
+      const go = textBtn(label, true, async () => {
+        const kind = draftConfirm;
+        go.disabled = true;
+        cancel.disabled = true;
+        if (kind === "clear") {
+          ctx.sendToBackend({ type: "draft_clear" });
+          draftConfirm = false;
+          draftMsg = "";
+          renderDraftView();
+          return;
+        }
+        const r = await rpc({ type: kind === "create" ? "card_create" : "card_undo" });
+        draftConfirm = false;
+        draftMsg =
+          r && r.ok
+            ? kind === "create"
+              ? `Created “${r.name}”. Find it in your characters, tagged danny-copilot.`
+              : "Card deleted."
+            : "Couldn't do that: " + ((r && r.error) || "unknown error");
+        renderDraftView();
+      });
+      row.append(go, cancel);
+      box.appendChild(row);
+      draftView.appendChild(box);
+    } else {
+      const area = el("div", "cp-card-actions");
+      if (created) {
+        area.appendChild(el("span", "cp-dim", `Created “${created.name}”`));
+        area.appendChild(textBtn("Undo (delete)", false, () => { draftConfirm = "undo"; renderDraftView(); }));
+      }
+      area.appendChild(
+        textBtn(created ? "Create another" : "Create card", true, () => { draftConfirm = "create"; renderDraftView(); }),
+      );
+      area.appendChild(textBtn("Clear draft", false, () => { draftConfirm = "clear"; renderDraftView(); }));
+      draftView.appendChild(area);
+    }
+  }
+
+  function setDraftOpen(v) {
+    if (v && ctxOpen) setCtxOpen(false);
+    draftOpen = v;
+    draftView.classList.toggle("open", v);
+    if (v) {
+      draftConfirm = false;
+      draftMsg = "";
+      renderDraftView();
+    }
+    updateCardBtn();
+    syncLog();
+    if (full) updateSide();
+  }
+
+  cardBtn.addEventListener("click", () => setDraftOpen(!draftOpen));
+  updateCardBtn();
+
   // ---------- fullscreen ----------
   let full = false;
   let fullWide = false;
   let autoCtx = false;
 
   function updateSide() {
-    const show = full && fullWide && (ctxOpen || setPanel.classList.contains("open"));
+    const show = full && fullWide && (ctxOpen || draftOpen || setPanel.classList.contains("open"));
     side.classList.toggle("show", show);
     root.classList.toggle("noside", full && fullWide && !show);
   }
@@ -773,10 +1009,11 @@ export function setup(ctx) {
     fullWide = window.innerWidth >= 1000;
     root.classList.toggle("wide", fullWide);
     if (fullWide) {
-      side.append(setPanel, ctxView);
+    side.append(setPanel, ctxView, draftView);
     } else {
       root.insertBefore(setPanel, chatLine);
       root.insertBefore(ctxView, bottomGroup);
+      root.insertBefore(draftView, bottomGroup);
     }
     syncLog();
     updateSide();
@@ -805,6 +1042,7 @@ export function setup(ctx) {
       tab.root.appendChild(root);
       root.insertBefore(setPanel, chatLine);
       root.insertBefore(ctxView, bottomGroup);
+      root.insertBefore(draftView, bottomGroup);
       syncLog();
     }
     fullBtn.innerHTML = svg(full ? ICONS.minimize : ICONS.maximize, 16);
@@ -1113,10 +1351,11 @@ export function setup(ctx) {
 
   function syncLog() {
     const setOpen = setPanel.classList.contains("open");
-    log.style.display = (ctxOpen || setOpen) && !(full && fullWide) ? "none" : "";
+    log.style.display = (ctxOpen || setOpen || draftOpen) && !(full && fullWide) ? "none" : "";
   }
 
   function setCtxOpen(v) {
+    if (v && draftOpen) setDraftOpen(false);
     ctxOpen = v;
     ctxView.classList.toggle("open", v);
     ctxBtn.classList.toggle("on", v);
@@ -1152,6 +1391,10 @@ export function setup(ctx) {
     promptTa.value = settings.systemPrompt || defaultSystem;
     propCb.checked = settings.proposals !== false;
     editCb.checked = settings.chatEdits !== false;
+    mkCb.checked = settings.cardMaker !== false;
+    tplSelect.value = settings.cardTemplate || "oc";
+    notesTa.value = settings.cardNotes || "";
+    updateCardBtn();
   }
 
   function commitCtx(n) {
@@ -1187,6 +1430,9 @@ export function setup(ctx) {
   personaCb.addEventListener("change", () => { settings.includePersona = personaCb.checked; saveSettings(); });
   propCb.addEventListener("change", () => { settings.proposals = propCb.checked; saveSettings(); });
   editCb.addEventListener("change", () => { settings.chatEdits = editCb.checked; saveSettings(); });
+  mkCb.addEventListener("change", () => { settings.cardMaker = mkCb.checked; saveSettings(); updateCardBtn(); });
+  tplSelect.addEventListener("change", () => { settings.cardTemplate = tplSelect.value; saveSettings(); });
+  notesTa.addEventListener("change", () => { settings.cardNotes = notesTa.value.trim(); saveSettings(); });
   loreCb.addEventListener("change", () => { settings.includeLore = loreCb.checked; saveSettings(); });
   budgetNum.addEventListener("change", () => {
     settings.loreBudget = Math.max(200, Math.min(8000, Math.floor(Number(budgetNum.value) || 1500)));
@@ -1641,6 +1887,7 @@ export function setup(ctx) {
   }
 
   function buildCard(i, k, block) {
+    if (block.kind === "draft") return buildDraftChip(block);
     if (block.kind === "chat") return buildChatCard(i, k, block);
     const m = history[i];
     const st = (Array.isArray(m.props) && m.props[k]) || { status: "pending" };
@@ -1776,7 +2023,7 @@ export function setup(ctx) {
     if (!currentBubble) return;
     const p = parseProposals(contBase ? joinContinuation(contBase, assistantText) : assistantText);
     let t = p.text;
-    const open = t.search(/<(lorebook_entry|chat_edit)\b/i);
+    const open = t.search(/<(lorebook_entry|chat_edit|card_draft)\b/i);
     if (open >= 0) t = t.slice(0, open).trimEnd();
     currentBubble.innerHTML =
       renderMarkdown(t) + (open >= 0 ? '<p class="cp-dim">drafting a proposal…</p>' : "");
@@ -1805,7 +2052,7 @@ export function setup(ctx) {
       log.appendChild(wrap);
     }
     log.scrollTop = log.scrollHeight;
-    ctx.sendToBackend({ type: "send", reqId, text, history: prior.slice(-40) });
+    ctx.sendToBackend({ type: "send", reqId, text, history: prior.slice(-200) });
   }
 
   const CONTINUE_PROMPT =
@@ -1831,10 +2078,15 @@ export function setup(ctx) {
     const sameKey = sendKey === currentKey;
     if (assistantText && sameKey) {
       const target = contIdx >= 0 ? history[contIdx] : null;
+      let finalText = assistantText;
       if (target && target.role === "assistant") {
         target.content = joinContinuation(contBase, assistantText);
+        finalText = target.content;
       } else {
         history.push({ role: "assistant", content: assistantText });
+      }
+      for (const b of parseProposals(finalText).blocks) {
+        if (b.kind === "draft") ctx.sendToBackend({ type: "draft_merge", fields: b.fields });
       }
     }
     contIdx = -1;
@@ -1913,6 +2165,10 @@ export function setup(ctx) {
         files = Array.isArray(p.files) ? p.files : [];
         renderChips();
 
+        draft = p.draft || null;
+        updateCardBtn();
+        if (draftOpen) renderDraftView();
+
         const general = settings.mode === "general" || !p.chat;
         chatLine.textContent =
           settings.mode === "general"
@@ -1961,7 +2217,9 @@ export function setup(ctx) {
       case "lore_undone":
       case "chat_lookup":
       case "chat_applied":
-      case "chat_undone": {
+      case "chat_undone":
+      case "card_created":
+      case "card_undone": {
         const cb = pendingCbs.get(p.rid);
         if (cb) {
           pendingCbs.delete(p.rid);
@@ -1974,6 +2232,12 @@ export function setup(ctx) {
         if (p.error) flashNote(p.error);
         else renderChips();
         updateReadout();
+        requestPreview();
+        break;
+      case "draft":
+        draft = p.draft || null;
+        updateCardBtn();
+        if (draftOpen && !p.quiet) renderDraftView();
         requestPreview();
         break;
       case "token":
