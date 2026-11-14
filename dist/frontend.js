@@ -208,17 +208,21 @@ const STYLES = `
   .cp-full:not(.wide) > .cp-set, .cp-full:not(.wide) > .cp-ctxview, .cp-full:not(.wide) > .cp-draftview {
     box-sizing:border-box; width:calc(100% - 40px); max-width:840px; align-self:center; margin-top:8px; }
 
-  .cp-root.cp-full.wide { display:grid; grid-template-columns:minmax(0,1fr) minmax(360px,440px);
+  .cp-root.cp-full.wide { display:grid; --lw:0px; --rw:0px;
+    grid-template-columns:var(--lw) minmax(0,1fr) var(--rw);
     grid-template-rows:auto auto minmax(0,1fr) auto; }
-  .cp-root.cp-full.wide.noside { grid-template-columns:minmax(0,1fr); }
-  .cp-full.wide > .cp-top { grid-column:1; grid-row:1; justify-self:center; padding-top:22px;
+  .cp-root.cp-full.wide.showl { --lw:minmax(330px,400px); }
+  .cp-root.cp-full.wide.showr { --rw:minmax(350px,440px); }
+  .cp-full.wide > .cp-top { grid-column:2; grid-row:1; justify-self:center; padding-top:22px;
     display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px 10px; }
   .cp-full.wide > .cp-top > .cp-toprow { grid-column:1 / -1; }
-  .cp-full.wide > .cp-chatline { grid-column:1; grid-row:2; justify-self:center; }
-  .cp-full.wide > .cp-log { grid-column:1; grid-row:3; justify-self:center; }
-  .cp-full.wide > .cp-bottom { grid-column:1; grid-row:4; justify-self:center; padding-bottom:24px; }
-  .cp-full.wide > .cp-side { grid-column:2; grid-row:1 / 5; padding:22px 20px 26px;
+  .cp-full.wide > .cp-chatline { grid-column:2; grid-row:2; justify-self:center; }
+  .cp-full.wide > .cp-log { grid-column:2; grid-row:3; justify-self:center; }
+  .cp-full.wide > .cp-bottom { grid-column:2; grid-row:4; justify-self:center; padding-bottom:24px; }
+  .cp-full.wide > .cp-side { grid-column:3; grid-row:1 / 5; padding:22px 20px 26px;
     background:var(--cp-surface); border-left:1px solid var(--cp-border); }
+  .cp-full.wide > .cp-sideL { grid-column:1; border-left:none; border-right:1px solid var(--cp-border); }
+  .cp-full.wide > .cp-sideL::before { content:"Context"; font-size:15px; font-weight:600; margin-bottom:2px; }
   .cp-full.wide > .cp-side.show { display:flex; }
 
   .cp-draftview { flex:1; min-height:0; overflow-y:auto; display:none; flex-direction:column; gap:10px; scrollbar-width:thin; }
@@ -845,8 +849,9 @@ export function setup(ctx) {
   bottomGroup.append(foot, chipBar, inputBar);
   chatLine.classList.add("cp-chatline");
   const side = el("div", "cp-side");
+  const sideL = el("div", "cp-side cp-sideL");
   const draftView = el("div", "cp-draftview");
-  root.append(topGroup, setPanel, chatLine, log, ctxView, draftView, bottomGroup, side);
+  root.append(topGroup, setPanel, chatLine, log, ctxView, draftView, bottomGroup, sideL, side);
   tab.root.appendChild(root);
 
   input.addEventListener("input", () => {
@@ -1005,7 +1010,7 @@ export function setup(ctx) {
   }
 
   function setDraftOpen(v) {
-    if (v && ctxOpen) setCtxOpen(false);
+    if (v && ctxOpen && !(full && fullBoth)) setCtxOpen(false);
     draftOpen = v;
     draftView.classList.toggle("open", v);
     if (v) {
@@ -1025,19 +1030,30 @@ export function setup(ctx) {
   let full = false;
   let fullWide = false;
   let autoCtx = false;
+  let autoDraft = false;
+  let fullBoth = false;
 
   function updateSide() {
-    const show = full && fullWide && (ctxOpen || draftOpen || setPanel.classList.contains("open"));
-    side.classList.toggle("show", show);
-    root.classList.toggle("noside", full && fullWide && !show);
+    const wide = full && fullWide;
+    const openR = draftOpen || setPanel.classList.contains("open") || (!fullBoth && ctxOpen);
+    const showR = wide && openR;
+    const showL = wide && fullBoth && ctxOpen;
+    side.classList.toggle("show", showR);
+    sideL.classList.toggle("show", showL);
+    root.classList.toggle("showr", showR);
+    root.classList.toggle("showl", showL);
   }
 
   function layoutFull() {
     if (!full) return;
     fullWide = window.innerWidth >= 1000;
+    fullBoth = fullWide && window.innerWidth >= 1450;
     root.classList.toggle("wide", fullWide);
-    if (fullWide) {
-    side.append(setPanel, ctxView, draftView);
+    if (fullBoth) {
+      sideL.append(ctxView);
+      side.append(setPanel, draftView);
+    } else if (fullWide) {
+      side.append(setPanel, ctxView, draftView);
     } else {
       root.insertBefore(setPanel, chatLine);
       root.insertBefore(ctxView, bottomGroup);
@@ -1054,7 +1070,16 @@ export function setup(ctx) {
       document.body.appendChild(root);
       root.classList.add("cp-full");
       layoutFull();
-      if (fullWide && !ctxOpen) {
+      if (fullBoth) {
+        if (!ctxOpen) {
+          autoCtx = true;
+          setCtxOpen(true);
+        }
+        if (!draftOpen && settings.cardMaker !== false) {
+          autoDraft = true;
+          setDraftOpen(true);
+        }
+      } else if (fullWide && !ctxOpen) {
         autoCtx = true;
         setCtxOpen(true);
       }
@@ -1063,10 +1088,16 @@ export function setup(ctx) {
         autoCtx = false;
         setCtxOpen(false);
       }
+      if (autoDraft) {
+        autoDraft = false;
+        setDraftOpen(false);
+      }
       full = false;
       fullWide = false;
-      root.classList.remove("cp-full", "wide", "noside");
+      fullBoth = false;
+      root.classList.remove("cp-full", "wide", "showl", "showr");
       side.classList.remove("show");
+      sideL.classList.remove("show");
       tab.root.appendChild(root);
       root.insertBefore(setPanel, chatLine);
       root.insertBefore(ctxView, bottomGroup);
@@ -1430,7 +1461,7 @@ export function setup(ctx) {
   }
 
   function setCtxOpen(v) {
-    if (v && draftOpen) setDraftOpen(false);
+    if (v && draftOpen && !(full && fullBoth)) setDraftOpen(false);
     ctxOpen = v;
     ctxView.classList.toggle("open", v);
     ctxBtn.classList.toggle("on", v);
