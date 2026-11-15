@@ -20,6 +20,7 @@ const ICONS = {
   plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
   maximize: '<path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>',
   minimize: '<path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
   forward: '<polygon points="13 19 22 12 13 5 13 19"/><polygon points="2 19 11 12 2 5 2 19"/>',
   idcard: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M6 17c.5-1.6 1.7-2.5 3-2.5s2.5.9 3 2.5"/><line x1="15" y1="9" x2="18" y2="9"/><line x1="15" y1="13" x2="18" y2="13"/>',
 };
@@ -520,6 +521,8 @@ export function setup(ctx) {
   let ctxImgTokens = 0;
   let noteTimer = 0;
   let hasChat = false;
+  let activeChatId = null;
+  let sendChat = null;
   let contIdx = -1;
   let contBase = "";
   let draft = null;
@@ -582,8 +585,8 @@ export function setup(ctx) {
   // row 1: mode, CTX slider, settings
   const topRow = el("div", "cp-row");
   const modeSelect = el("select", "cp-sel");
-  modeSelect.style.width = "104px";
-  for (const [v, t] of [["chat", "This chat"], ["general", "General"]]) {
+  modeSelect.style.width = "124px";
+  for (const [v, t] of [["chat", "This chat"], ["character", "This character"], ["general", "General"]]) {
     const o = el("option", "", t);
     o.value = v;
     modeSelect.appendChild(o);
@@ -627,7 +630,10 @@ export function setup(ctx) {
   const newBtn = iconBtn(ICONS.plus, "New session");
   const renBtn = iconBtn(ICONS.edit, "Rename session");
   const delBtn = iconBtn(ICONS.trash, "Delete session");
-  sessRow.append(sessSelect, renameInput, newBtn, renBtn, delBtn);
+  const shareBtn = iconBtn(ICONS.link, "Copy this session to \u201cThis character\u201d so every chat with this character can use it");
+  shareBtn.style.display = "none";
+  shareBtn.addEventListener("click", () => ctx.sendToBackend({ type: "session_share", sid: sessions.active }));
+  sessRow.append(sessSelect, renameInput, newBtn, renBtn, shareBtn, delBtn);
 
   // settings panel
   const setPanel = el("div", "cp-set");
@@ -1930,12 +1936,13 @@ export function setup(ctx) {
     lookups.add(key);
     const keyAtStart = currentKey;
     const msgRef = history[i];
-    rpc({ type: "chat_lookup", chatId: currentBase, index: block.message }).then((r) => {
+    const cid = (msgRef && msgRef.chat) || currentBase;
+    rpc({ type: "chat_lookup", chatId: cid, index: block.message }).then((r) => {
       lookups.delete(key);
       if (currentKey !== keyAtStart || history[i] !== msgRef) return;
       if (r && r.ok) {
         setProp(i, k, {
-          chatId: currentBase,
+          chatId: cid,
           chatName: r.chatName,
           msgId: r.msgId,
           msgRole: r.role,
@@ -2214,6 +2221,7 @@ export function setup(ctx) {
 
   function generate(text, prior, cont, cardForce) {
     sendKey = currentKey;
+    sendChat = activeChatId;
     assistantText = "";
     contIdx = -1;
     contBase = "";
@@ -2265,7 +2273,9 @@ export function setup(ctx) {
         target.content = joinContinuation(contBase, assistantText);
         finalText = target.content;
       } else {
-        history.push({ role: "assistant", content: assistantText });
+        const msg = { role: "assistant", content: assistantText };
+        if (sendChat) msg.chat = sendChat;
+        history.push(msg);
       }
       for (const b of parseProposals(finalText).blocks) {
         if (b.kind === "draft") ctx.sendToBackend({ type: "draft_merge", fields: b.fields });
@@ -2355,10 +2365,14 @@ export function setup(ctx) {
         chatLine.textContent =
           settings.mode === "general"
             ? "General chat (no chat context)"
-            : p.chat
-              ? "Chat: " + p.chat.name
-              : "No active chat, using General";
+            : settings.mode === "character" && String(p.sessionKey).startsWith("char_")
+              ? "Character: " + (p.charName || "this character") + (p.chat ? " · chat: " + p.chat.name : "")
+              : p.chat
+                ? "Chat: " + p.chat.name
+                : "No active chat, using General";
         hasChat = !!p.chat;
+        activeChatId = p.chat ? p.chat.id : null;
+        shareBtn.style.display = settings.mode === "chat" && p.hasChar ? "" : "none";
         if (p.defaultVoices) defaultVoices = p.defaultVoices;
         renderVoiceOptions();
         syncVoiceUI();
@@ -2423,6 +2437,9 @@ export function setup(ctx) {
         updateCardBtn();
         if (draftOpen && !p.quiet) renderDraftView();
         requestPreview();
+        break;
+      case "notice":
+        flashNote(p.text);
         break;
       case "token":
         if (p.reqId !== reqId || !currentBubble) return;

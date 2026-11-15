@@ -233,6 +233,7 @@ function cleanHistory(raw) {
     .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
     .map((m) => {
       const o = { role: m.role, content: m.content };
+      if (typeof m.chat === "string" && m.chat) o.chat = m.chat.slice(0, 100);
       const p = cleanProps(m.props);
       if (p) o.props = p;
       return o;
@@ -242,7 +243,7 @@ function cleanHistory(raw) {
 function cleanSettings(s) {
   const o = { ...DEFAULTS };
   if (s && typeof s === "object") {
-    if (s.mode === "chat" || s.mode === "general") o.mode = s.mode;
+    if (s.mode === "chat" || s.mode === "character" || s.mode === "general") o.mode = s.mode;
     const n = Number(s.ctxCount);
     if (Number.isFinite(n)) o.ctxCount = Math.max(0, Math.min(200, Math.floor(n)));
     if (typeof s.connectionId === "string") o.connectionId = s.connectionId;
@@ -353,15 +354,31 @@ async function saveSessions(key, userId, idx) {
   }
 }
 
+// Copilot sessions live under one key: the chat, the chat's character, or "general".
+function sessionKeyFor(settings, active) {
+  if (!active || settings.mode === "general") return "general";
+  if (settings.mode === "character" && active.character_id) return "char_" + active.character_id;
+  return active.id;
+}
+
 async function resolveKey(userId) {
   const settings = await getSettings(userId);
   const active = await spindle.chats.getActive(userId);
-  const key = settings.mode === "general" || !active ? "general" : active.id;
+  const key = sessionKeyFor(settings, active);
   return { settings, active, key };
 }
 
 async function sendInit(userId) {
   const { settings, active, key } = await resolveKey(userId);
+  let charName = "";
+  if (settings.mode === "character" && active && active.character_id) {
+    try {
+      const c = await spindle.characters.get(active.character_id, userId);
+      charName = c ? String(c.name || "") : "";
+    } catch (e) {
+      spindle.log.warn("[Copilot] character name failed: " + e.message);
+    }
+  }
   const connections = await spindle.connections.list(userId);
   const sessions = await getSessions(key, userId);
   const history = await loadHistory(sessPath(key, sessions.active), userId);
@@ -376,6 +393,8 @@ async function sendInit(userId) {
       is_default: c.is_default,
     })),
     chat: active ? { id: active.id, name: active.name } : null,
+    charName,
+    hasChar: !!(active && active.character_id),
     sessionKey: key,
     sessionId: sessions.active,
     sessions,
@@ -798,7 +817,7 @@ async function buildContext(userId, settings, opts = {}) {
   let cardActive = false;
   if (settings.cardMaker) {
     try {
-      const dkey = useChat ? active.id : "general";
+      const dkey = sessionKeyFor(settings, active);
       const dsx = await getSessions(dkey, userId);
       const dr = await getDraft(userId, dkey, dsx.active);
       const has = draftHas(dr);
@@ -840,7 +859,7 @@ async function buildContext(userId, settings, opts = {}) {
   let images = [];
   let imgTokensTotal = 0;
   try {
-    const shelfKey = useChat ? active.id : "general";
+    const shelfKey = sessionKeyFor(settings, active);
     const sidx = await getSessions(shelfKey, userId);
     const shelf = await getShelf(userId, shelfKey, sidx.active);
     shelf.items
@@ -1562,6 +1581,45 @@ spindle.onFrontendMessage(async (payload, userId) => {
       } catch (e) {
         spindle.log.warn("[Copilot] card_list failed: " + e.message);
         spindle.sendToFrontend({ type: "card_list", rid, ok: false, error: e.message }, userId);
+      }
+      break;
+    }
+
+    case "session_share": {
+      try {
+        const { active, key } = await resolveKey(userId);
+        if (!active || !active.character_id || key === "general" || key.startsWith("char_")) {
+          throw new Error("Switch to “This chat” on a chat that has a character first.");
+        }
+        const ckey = "char_" + active.character_id;
+        const idx = await getSessions(key, userId);
+        const sid = String(payload.sid || "");
+        const src = idx.list.find((s) => s.id === sid);
+        if (!src) break;
+        const cidx = await getSessions(ckey, userId);
+        if (cidx.list.length >= 100) throw new Error("This character already has 100 sessions.");
+        const nid = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+
+        const hist = (await loadHistory(sessPath(key, sid), userId)).slice(-200).map((m) =>
+          m.role === "assistant" && !m.chat ? { ...m, chat: key } : m,
+        );
+        await spindle.userStorage.setJson(sessPath(ckey, nid), hist, { userId });
+        const shelf = await getShelf(userId, key, sid);
+        if (shelf.items.length) {
+          await spindle.userStorage.setJson(filesPath(ckey, nid), { items: shelf.items }, { userId });
+        }
+        const dr = await getDraft(userId, key, sid);
+        if (draftHas(dr)) {
+          await spindle.userStorage.setJson(draftPath(ckey, nid), { fields: dr.fields, created: dr.created }, { userId });
+        }
+        await saveSessions(ckey, userId, { active: cidx.active, list: [...cidx.list, { id: nid, name: src.name }] });
+        spindle.sendToFrontend({
+          type: "notice",
+          text: `Copied “${src.name}” to this character. Switch to “This character” to use it.`,
+        }, userId);
+      } catch (e) {
+        spindle.log.warn("[Copilot] session_share failed: " + e.message);
+        spindle.sendToFrontend({ type: "notice", text: "Couldn't copy that session: " + e.message }, userId);
       }
       break;
     }
