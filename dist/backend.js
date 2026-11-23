@@ -184,6 +184,8 @@ const loreCache = new Map();
 const lorePrefsCache = new Map();
 const pickCache = new Map();
 const sessCache = new Map();
+const activeGens = new Map(); // replies being written right now, per user
+const lastGens = new Map(); // the last finished reply, per user
 const attachedCache = new Map();
 const namesCache = new Map();
 const limitCache = {};
@@ -368,6 +370,36 @@ async function resolveKey(userId) {
   return { settings, active, key };
 }
 
+// ---------- replies are saved on the server while they stream ----------
+// So a refresh, a locked phone or a dropped connection can't lose a reply: it is already in the session file.
+function joinCont(base, add) {
+  if (!base) return add;
+  if (/^\s/.test(add) || /\s$/.test(base)) return base + add;
+  if (/[.!?…"”’)\]*_~]$/.test(base)) return base + " " + add;
+  return base + add;
+}
+
+function persistGen(userId, gen) {
+  gen.last = Date.now();
+  gen.chain = gen.chain.then(async () => {
+    try {
+      const hist = gen.base.map((m) => ({ ...m }));
+      if (gen.cont) {
+        const i = hist.length - 1;
+        if (i >= 0 && hist[i].role === "assistant") hist[i].content = joinCont(gen.baseLast, gen.text);
+      } else if (gen.text) {
+        const m = { role: "assistant", content: gen.text };
+        if (gen.chatId) m.chat = gen.chatId;
+        hist.push(m);
+      }
+      await spindle.userStorage.setJson(sessPath(gen.key, gen.sid), cleanHistory(hist).slice(-200), { userId });
+    } catch (e) {
+      spindle.log.warn("[Copilot] save reply failed: " + e.message);
+    }
+  });
+  return gen.chain;
+}
+
 async function sendInit(userId) {
   const { settings, active, key } = await resolveKey(userId);
   let charName = "";
@@ -381,7 +413,21 @@ async function sendInit(userId) {
   }
   const connections = await spindle.connections.list(userId);
   const sessions = await getSessions(key, userId);
-  const history = await loadHistory(sessPath(key, sessions.active), userId);
+  let history = await loadHistory(sessPath(key, sessions.active), userId);
+  let genState = null;
+  const g = activeGens.get(uk(userId));
+  if (g && !g.done && g.key === key && g.sid === sessions.active) {
+    genState = { reqId: g.reqId, text: g.text, cont: g.cont };
+    history = history.slice();
+    const li = history.length - 1;
+    if (g.cont) {
+      if (li >= 0 && history[li].role === "assistant") history[li] = { ...history[li], content: g.baseLast };
+    } else {
+      if (li >= 0 && history[li].role === "assistant" && g.text.startsWith(history[li].content)) history.pop();
+      const l2 = history[history.length - 1];
+      if (!(l2 && l2.role === "user" && l2.content === g.userText)) history.push({ role: "user", content: g.userText });
+    }
+  }
   const shelf = await getShelf(userId, key, sessions.active);
   const dr = await getDraft(userId, key, sessions.active);
   spindle.sendToFrontend({
@@ -399,6 +445,7 @@ async function sendInit(userId) {
     sessionId: sessions.active,
     sessions,
     history,
+    gen: genState,
     files: lightFiles(shelf.items),
     draft: lightDraft(dr),
     settings,
@@ -1624,6 +1671,22 @@ spindle.onFrontendMessage(async (payload, userId) => {
       break;
     }
 
+    case "resync": {
+      const rid = Number(payload.reqId);
+      const g2 = activeGens.get(uk(userId));
+      if (g2 && g2.reqId === rid && !g2.done) {
+        spindle.sendToFrontend({ type: "gen_state", reqId: rid, text: g2.text, done: false }, userId);
+      } else {
+        const l = lastGens.get(uk(userId));
+        if (l && l.reqId === rid) {
+          spindle.sendToFrontend({ type: "gen_state", reqId: rid, text: l.text, done: true }, userId);
+        } else {
+          spindle.sendToFrontend({ type: "gen_state", reqId: rid, text: "", done: true, lost: true }, userId);
+        }
+      }
+      break;
+    }
+
     case "save_settings": {
       const s = cleanSettings(payload.settings);
       cache[uk(userId)] = s;
@@ -1658,6 +1721,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const ctl = new AbortController();
       controller = ctl;
       const reqId = payload.reqId;
+      let gen = null;
 
       try {
         const settings = await getSettings(userId);
@@ -1669,7 +1733,8 @@ spindle.onFrontendMessage(async (payload, userId) => {
           : text;
         const { sections, images, cardActive } = await buildContext(userId, settings, { forSend: true, cardIntent });
 
-        const past = cleanHistory(payload.history)
+        const fullHistory = cleanHistory(payload.history);
+        const past = fullHistory
           .slice(cardActive ? -200 : -40)
           .map(({ role, content }) => ({ role, content }));
         const lastContent = images.length
@@ -1685,18 +1750,52 @@ spindle.onFrontendMessage(async (payload, userId) => {
         const input = { type: "quiet", messages, userId, signal: ctl.signal };
         if (settings.connectionId) input.connection_id = settings.connectionId;
 
+        // track this reply on the server so it survives a refresh or a dropped connection
+        const { key: gkey, active: gactive } = await resolveKey(userId);
+        const gsx = await getSessions(gkey, userId);
+        const cont = payload.cont === true;
+        const base = fullHistory.slice();
+        if (!cont) base.push({ role: "user", content: text });
+        gen = {
+          reqId,
+          key: gkey,
+          sid: gsx.active,
+          cont,
+          chatId: gactive ? gactive.id : null,
+          userText: text,
+          baseLast: cont && base.length ? base[base.length - 1].content : "",
+          base,
+          text: "",
+          done: false,
+          last: 0,
+          chain: Promise.resolve(),
+        };
+        activeGens.set(uk(userId), gen);
+
         for await (const chunk of spindle.generate.quietStream(input)) {
           if (chunk.type === "token") {
+            gen.text += chunk.token;
             spindle.sendToFrontend({ type: "token", reqId, token: chunk.token }, userId);
+            if (Date.now() - gen.last >= 2000) persistGen(userId, gen);
           }
         }
+        gen.done = true;
+        await persistGen(userId, gen);
+        lastGens.set(uk(userId), { reqId, text: gen.text });
         spindle.sendToFrontend({ type: "done", reqId }, userId);
       } catch (err) {
+        if (gen) {
+          gen.done = true;
+          await persistGen(userId, gen);
+          lastGens.set(uk(userId), { reqId, text: gen.text });
+        }
         if (err && err.name === "AbortError") {
           spindle.sendToFrontend({ type: "stopped", reqId }, userId);
         } else {
           spindle.sendToFrontend({ type: "error", reqId, message: String((err && err.message) || err) }, userId);
         }
+      } finally {
+        if (gen && activeGens.get(uk(userId)) === gen) activeGens.delete(uk(userId));
       }
       break;
     }

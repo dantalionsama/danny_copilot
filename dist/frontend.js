@@ -523,6 +523,8 @@ export function setup(ctx) {
   let hasChat = false;
   let activeChatId = null;
   let sendChat = null;
+  let lastTokenAt = 0;
+  let lastResync = 0;
   let contIdx = -1;
   let contBase = "";
   let draft = null;
@@ -2219,6 +2221,40 @@ export function setup(ctx) {
     log.scrollTop = log.scrollHeight;
   }
 
+  // A reply is still being written on the server (page refreshed or reconnected): pick it back up.
+  function applyGen(g) {
+    if (!g) return;
+    if (busy) {
+      if (g.reqId === reqId && typeof g.text === "string" && g.text.length > assistantText.length) {
+        assistantText = g.text;
+        lastTokenAt = Date.now();
+        if (!raf) raf = requestAnimationFrame(paintStream);
+      }
+      return;
+    }
+    reqId = g.reqId;
+    sendKey = currentKey;
+    sendChat = activeChatId;
+    assistantText = g.text || "";
+    contIdx = g.cont && history.length ? history.length - 1 : -1;
+    contBase = contIdx >= 0 ? history[contIdx].content : "";
+    currentBubble = null;
+    lastTokenAt = Date.now();
+    setBusy(true);
+    renderHistory();
+    if (contIdx >= 0) {
+      const last = log.lastElementChild;
+      currentBubble = last ? last.querySelector(".cp-md") : null;
+    }
+    if (!currentBubble) {
+      const wrap = el("div", "cp-wrap assistant");
+      currentBubble = el("div", "cp-msg assistant cp-md", "…");
+      wrap.appendChild(currentBubble);
+      log.appendChild(wrap);
+    }
+    paintStream();
+  }
+
   function generate(text, prior, cont, cardForce) {
     sendKey = currentKey;
     sendChat = activeChatId;
@@ -2242,7 +2278,8 @@ export function setup(ctx) {
       log.appendChild(wrap);
     }
     log.scrollTop = log.scrollHeight;
-    ctx.sendToBackend({ type: "send", reqId, text, history: prior.slice(-200), cardForce: !!cardForce });
+    lastTokenAt = Date.now();
+    ctx.sendToBackend({ type: "send", reqId, text, history: prior.slice(-200), cardForce: !!cardForce, cont: !!cont });
   }
 
   const CONTINUE_PROMPT =
@@ -2394,6 +2431,7 @@ export function setup(ctx) {
           renderHistory();
           wantBottom();
         }
+        applyGen(p.gen);
         requestPreview();
         break;
       }
@@ -2438,11 +2476,23 @@ export function setup(ctx) {
         if (draftOpen && !p.quiet) renderDraftView();
         requestPreview();
         break;
+      case "gen_state":
+        if (p.reqId !== reqId || !busy) return;
+        if (typeof p.text === "string" && p.text.length > assistantText.length) assistantText = p.text;
+        lastTokenAt = Date.now();
+        if (p.done) {
+          if (p.lost && !assistantText) flashNote("Lost the connection to that reply. Try sending it again.");
+          finish();
+        } else if (!raf) {
+          raf = requestAnimationFrame(paintStream);
+        }
+        break;
       case "notice":
         flashNote(p.text);
         break;
       case "token":
         if (p.reqId !== reqId || !currentBubble) return;
+        lastTokenAt = Date.now();
         assistantText += p.token;
         if (!raf) raf = requestAnimationFrame(paintStream);
         break;
@@ -2470,14 +2520,31 @@ export function setup(ctx) {
 
   tab.onActivate(() => {
     ctx.sendToBackend({ type: "init" });
+    if (busy) ctx.sendToBackend({ type: "resync", reqId });
     wantBottom();
   });
+
+  // If a reply stalls (weak or dropped connection), ask the server where it is.
+  const onVisible = () => {
+    if (!document.hidden && busy) ctx.sendToBackend({ type: "resync", reqId });
+  };
+  document.addEventListener("visibilitychange", onVisible);
+  const watchdog = setInterval(() => {
+    if (!busy) return;
+    const now = Date.now();
+    if (now - lastTokenAt > 12000 && now - lastResync > 12000) {
+      lastResync = now;
+      ctx.sendToBackend({ type: "resync", reqId });
+    }
+  }, 4000);
   ctx.sendToBackend({ type: "init" });
 
   return () => {
     document.removeEventListener("keydown", onKey);
     window.removeEventListener("resize", onResize);
     root.remove();
+    document.removeEventListener("visibilitychange", onVisible);
+    clearInterval(watchdog);
     if (bottomObserver) bottomObserver.disconnect();
     if (raf) cancelAnimationFrame(raf);
     clearTimeout(delTimer);
